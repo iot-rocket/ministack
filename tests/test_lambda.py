@@ -10364,9 +10364,10 @@ def _functions_reaching_a_lambda_execution(root):
 
 
 def test_no_lambda_execution_rides_the_default_thread_pool():
-    """No ``asyncio.to_thread`` call anywhere in the package takes a blocking
-    Lambda execution as its target — directly or several calls down — because
-    they all go through ``lambda_svc.run_invocation_in_thread``."""
+    """No ``asyncio.to_thread`` or ``run_in_executor`` call anywhere in the
+    package takes a blocking Lambda execution as its target — directly or
+    several calls down — because they all go through
+    ``lambda_svc.run_invocation_in_thread``."""
     import ast
     import pathlib
 
@@ -10380,9 +10381,24 @@ def test_no_lambda_execution_rides_the_default_thread_pool():
             if not isinstance(node, ast.Call) or not node.args:
                 continue
             func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "to_thread"):
+            func_name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", None)
+            )
+            if func_name == "to_thread":
+                # Matches ``asyncio.to_thread(f, ...)`` AND a bare
+                # ``to_thread(f, ...)`` from ``from asyncio import to_thread``.
+                target = node.args[0]
+            elif func_name == "run_in_executor" and len(node.args) >= 2:
+                # ``loop.run_in_executor(executor, f, ...)``: with executor
+                # None this is the very same shared default pool that
+                # ``to_thread`` uses, and a private bounded executor is no
+                # better a home for a re-entrant invoke — either way the
+                # execution must go through run_invocation_in_thread.
+                target = node.args[1]
+            else:
                 continue
-            target = node.args[0]
             name = (
                 target.attr
                 if isinstance(target, ast.Attribute)
