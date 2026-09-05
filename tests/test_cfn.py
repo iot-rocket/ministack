@@ -2055,6 +2055,42 @@ def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
 
 
+def test_cfn_stack_id_addresses_every_read_action(cfn, sqs):
+    """Every action that takes a StackName accepts the stack id (what the CDK
+    sends after its first DescribeStacks), and the responses carry the stack's
+    name, not the id that was passed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-by-id-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"cfn-by-id-{uid}"}}}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+
+        assert cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackName"] == stack_name
+        detail = cfn.describe_stack_resource(StackName=stack_id, LogicalResourceId="Queue")
+        assert detail["StackResourceDetail"]["StackName"] == stack_name
+        resources = cfn.describe_stack_resources(StackName=stack_id)["StackResources"]
+        assert [r["StackName"] for r in resources] == [stack_name]
+        summaries = cfn.list_stack_resources(StackName=stack_id)["StackResourceSummaries"]
+        assert [r["LogicalResourceId"] for r in summaries] == ["Queue"]
+        assert cfn.get_template(StackName=stack_id)["TemplateBody"]
+        assert cfn.describe_stack_events(StackName=stack_id)["StackEvents"]
+        assert cfn.get_template_summary(StackName=stack_id)["ResourceTypes"] == ["AWS::SQS::Queue"]
+
+        cfn.create_change_set(StackName=stack_id, ChangeSetName="by-id", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {"Queue": {
+                                  "Type": "AWS::SQS::Queue", "Properties": {
+                                      "QueueName": f"cfn-by-id-{uid}",
+                                      "VisibilityTimeout": 45}}}}))
+        described = cfn.describe_change_set(ChangeSetName="by-id", StackName=stack_name)
+        assert described["StackName"] == stack_name
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_yaml_template(cfn, s3):
     yaml_body = """
 AWSTemplateFormatVersion: '2010-09-09'
