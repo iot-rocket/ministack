@@ -1159,6 +1159,64 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     assert any("cfn-t02-custom" in u for u in urls)
 
 
+def test_cfn_parameter_constraints_are_enforced(cfn):
+    """AllowedPattern, MinLength, MaxLength, MinValue and MaxValue are checked
+    before a stack exists, with CloudFormation's message (measured:
+    ``Parameter 'P' must match pattern ^[a-z]+$``); a ConstraintDescription
+    replaces the reason; a CommaDelimitedList is checked per member."""
+    uid = _uuid_mod.uuid4().hex[:8]
+
+    def template(params):
+        return json.dumps({"Parameters": params, "Resources": {"P": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/cfn-constraints/{uid}", "Type": "String",
+                           "Value": {"Ref": next(iter(params))}}}}})
+
+    def refused(params, value, expected):
+        name = f"cfn-constraints-{uid}-{_uuid_mod.uuid4().hex[:4]}"
+        key = next(iter(params))
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=template(params),
+                             Parameters=[{"ParameterKey": key, "ParameterValue": value}])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    refused({"P": {"Type": "String", "AllowedPattern": "^[a-z]+$", "MinLength": "3",
+                   "MaxLength": "3"}}, "ABC1", "Parameter 'P' must match pattern ^[a-z]+$")
+    refused({"P": {"Type": "String", "AllowedPattern": "[a-z]+", "ConstraintDescription":
+                   "must be lowercase letters"}}, "abc1", "Parameter 'P' must be lowercase letters")
+    refused({"P": {"Type": "String", "MinLength": "3"}}, "ab",
+            "Parameter 'P' must contain at least 3 characters")
+    refused({"P": {"Type": "String", "MaxLength": "3"}}, "abcd",
+            "Parameter 'P' must contain at most 3 characters")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "0",
+            "Parameter 'N' must be a number not less than 1")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "11",
+            "Parameter 'N' must be a number not greater than 10")
+    refused({"L": {"Type": "CommaDelimitedList", "AllowedPattern": "[a-z]+"}}, "ab, c1",
+            "Parameter 'L' must match pattern [a-z]+")
+    refused({"L": {"Type": "List<Number>"}}, "1,x",
+            "Parameter 'L' value '1,x' is not a valid List<Number>")
+    refused({"L": {"Type": "List<Number>", "MinValue": "1"}}, "1,0",
+            "Parameter 'L' must be a number not less than 1")
+    refused({"P": {"Type": "String", "AllowedPattern": "["}}, "abc",
+            "Parameter 'P' has an invalid AllowedPattern: unterminated character set at position 0")
+
+    # A Default that satisfies the constraints and a valid override both pass.
+    name = f"cfn-constraints-ok-{uid}"
+    params = {"P": {"Type": "String", "Default": "abc", "AllowedPattern": "^[a-z]+$",
+                    "MinLength": "1", "MaxLength": "5"}}
+    cfn.create_stack(StackName=name, TemplateBody=template(params),
+                     Parameters=[{"ParameterKey": "P", "ParameterValue": "hello"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     """A stack update must not touch an auto-named resource whose own
     properties didn't change — DynamoDB::Table has no update handler, so it

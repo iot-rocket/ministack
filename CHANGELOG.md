@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — parameter constraints are enforced** — `AllowedPattern`, `MinLength`, `MaxLength`, `MinValue` and `MaxValue` were ignored (only `AllowedValues` was checked), so a value a real account refuses deployed locally. They are checked before a stack exists, with CloudFormation's message (`Parameter 'P' must match pattern ^[a-z]+$`, measured) and a `ConstraintDescription` in place of the reason; a `CommaDelimitedList` is matched per member and a `List<Number>` is validated as numbers. Contributed by @iot-rocket.
+
 ## [1.5.8] — 2026-09-05
 
 ### Added
