@@ -371,10 +371,12 @@ def _execute_change_set(params):
             "_template": copy.deepcopy(stack.get("_template", {})),
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+            "_conditions": copy.deepcopy(stack.get("_conditions", {})),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
         previous_stack = None
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
@@ -400,7 +402,8 @@ def _execute_change_set(params):
                 _deploy_stack_async(real_stack_name, stack_id, template,
                                     param_values, False, tags,
                                     is_update=is_update,
-                                    previous_stack=previous_stack),
+                                    previous_stack=previous_stack,
+                                    retain_except_on_create=retain_except_on_create),
             ),
             stack,
             stack_id,
