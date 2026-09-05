@@ -165,11 +165,11 @@ def validate_template_support(template: dict, conditions: dict) -> None:
             if cond and not conditions.get(cond, True):
                 continue
             rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
-            if (
-                rtype in _RESOURCE_HANDLERS
-                or rtype.startswith("Custom::")
-                or rtype.startswith("AWS::CloudFormation::")
-            ):
+            # The registered AWS::CloudFormation::* types (WaitCondition,
+            # WaitConditionHandle, Stack, CustomResource) pass like any other
+            # handler; an unregistered one (Macro, HookVersion, a typo) is
+            # unrecognized, not a silent placeholder.
+            if rtype in _RESOURCE_HANDLERS or rtype.startswith("Custom::"):
                 continue
             unrecognized.add(rtype)
     if unrecognized:

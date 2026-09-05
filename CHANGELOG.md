@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **CloudFormation — parameter constraints are enforced** — `AllowedPattern`, `MinLength`, `MaxLength`, `MinValue` and `MaxValue` were ignored (only `AllowedValues` was checked), so a value a real account refuses deployed locally. They are checked before a stack exists, with CloudFormation's message (`Parameter 'P' must match pattern ^[a-z]+$`, measured) and a `ConstraintDescription` in place of the reason; a `CommaDelimitedList` is matched per member and a `List<Number>` is validated as numbers. Contributed by @iot-rocket.
+- **CloudFormation — an unregistered `AWS::CloudFormation::*` type is unrecognized, not a silent no-op** — `AWS::CloudFormation::Macro`, `HookVersion`, `ModuleVersion` and any typo under that prefix deployed as a placeholder with a fabricated physical id, logged at INFO, while the README promises that unsupported types do not silently succeed. The pre-flight now treats them like every other unrecognized type (`Template format error: Unrecognized resource types`); the registered ones — `WaitCondition`, `WaitConditionHandle`, `Stack`, `CustomResource` — are unaffected. Contributed by @iot-rocket.
 
 ## [1.5.8] — 2026-09-05
 

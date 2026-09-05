@@ -11396,6 +11396,32 @@ def test_cfn_unrecognized_type_behind_false_condition_is_fine(cfn):
         _wait_stack(cfn, name)
 
 
+def test_cfn_unknown_cloudformation_type_is_rejected_like_any_other(cfn):
+    """An unregistered AWS::CloudFormation::* type (a Macro, a typo) is
+    'Unrecognized resource types', not a silent no-op placeholder; the
+    registered ones (WaitConditionHandle) still deploy."""
+    name = "cfn-preflight-cfn-types"
+    bad = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+        "Typo": {"Type": "AWS::CloudFormation::DoesNotExist", "Properties": {}},
+    }})
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=name, TemplateBody=bad)
+    assert exc.value.response["Error"]["Message"] == (
+        "Template format error: Unrecognized resource types: "
+        "[AWS::CloudFormation::DoesNotExist]")
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=name)
+
+    good = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}})
+    cfn.create_stack(StackName=name, TemplateBody=good)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_validate_template_accepts_a_sam_template(cfn):
     """A template that declares a Transform is exempt from the unrecognized
     type check: a macro can rewrite any resource, so real CloudFormation does
