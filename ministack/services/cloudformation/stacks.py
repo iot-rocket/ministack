@@ -504,8 +504,29 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
 # Change Set Helpers
 # ===========================================================================
 
+# The resource attributes a change set compares next to Properties; each is
+# also the ResourceTargetDefinition Attribute value it reports. A change to one
+# of them alone is a Modify with Replacement False (measured: an
+# UpdateReplacePolicy edit lists `Modify / False / UpdateReplacePolicy`). A Type
+# change is handled apart (a replacement). DependsOn and Condition are absent on
+# purpose: a DependsOn-only edit did not show up as a change on AWS.
+_DIFFED_ATTRIBUTES = (
+    "Metadata",
+    "CreationPolicy",
+    "UpdatePolicy",
+    "DeletionPolicy",
+    "UpdateReplacePolicy",
+)
+
+
 def _diff_resources(old_template: dict, new_template: dict) -> list:
-    """Diff two templates and return a list of change dicts."""
+    """Diff two templates and return a list of change dicts.
+
+    A resource is a ``Modify`` when its ``Properties`` differ or when one of the
+    attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
+    a ``Details`` entry (``Target.Attribute``, plus the property name for
+    ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
     changes = []
@@ -532,15 +553,44 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                 }
             })
         else:
-            old_props = old_res[key].get("Properties", {})
-            new_props = new_res[key].get("Properties", {})
+            details = []
+            old_props = old_res[key].get("Properties", {}) or {}
+            new_props = new_res[key].get("Properties", {}) or {}
             if old_props != new_props:
-                changes.append({
-                    "ResourceChange": {
-                        "Action": "Modify",
-                        "LogicalResourceId": key,
-                        "ResourceType": new_res[key].get("Type", ""),
-                        "Replacement": "Conditional",
-                    }
-                })
+                for name in sorted(set(old_props) | set(new_props)):
+                    if old_props.get(name) != new_props.get(name):
+                        details.append({
+                            "Target": {"Attribute": "Properties", "Name": name,
+                                       "RequiresRecreation": "Conditionally"},
+                            "Evaluation": "Static",
+                            "ChangeSource": "DirectModification",
+                        })
+            for attr in _DIFFED_ATTRIBUTES:
+                if old_res[key].get(attr) != new_res[key].get(attr):
+                    details.append({
+                        "Target": {"Attribute": attr},
+                        "Evaluation": "Static",
+                        "ChangeSource": "DirectModification",
+                    })
+            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
+            if not details and not type_changed:
+                continue
+            scope = []
+            for d in details:
+                if d["Target"]["Attribute"] not in scope:
+                    scope.append(d["Target"]["Attribute"])
+            if type_changed or old_props != new_props:
+                replacement = "True" if type_changed else "Conditional"
+            else:
+                replacement = "False"
+            changes.append({
+                "ResourceChange": {
+                    "Action": "Modify",
+                    "LogicalResourceId": key,
+                    "ResourceType": new_res[key].get("Type", ""),
+                    "Replacement": replacement,
+                    "Scope": scope,
+                    "Details": details,
+                }
+            })
     return changes

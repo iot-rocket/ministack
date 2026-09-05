@@ -1350,6 +1350,77 @@ def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
         cfn.delete_stack(StackName=S)
 
 
+def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
+    """A change set lists a resource whose DeletionPolicy, UpdateReplacePolicy
+    or Metadata changed and nothing else: Modify, Replacement False, the
+    attribute in Scope and Details, and the executed set stores the new
+    template. A DependsOn-only edit is not a change, as on AWS."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cs-attrs-{uid}"
+
+    def template(policy=None, depends=False, metadata=None, queue_name=None):
+        queue = {"Type": "AWS::SQS::Queue",
+                 "Properties": {"QueueName": queue_name or f"cfn-cs-attrs-{uid}"}}
+        if policy:
+            queue["DeletionPolicy"] = policy
+            queue["UpdateReplacePolicy"] = policy
+        if metadata:
+            queue["Metadata"] = metadata
+        param = {"Type": "AWS::SSM::Parameter",
+                 "Properties": {"Name": f"/cfn-cs-attrs/{uid}", "Type": "String",
+                                "Value": "v"}}
+        if depends:
+            param["DependsOn"] = "Queue"
+        return json.dumps({"Resources": {"Queue": queue, "Param": param}})
+
+    def changes_of(name, body):
+        cfn.create_change_set(StackName=stack_name, ChangeSetName=name,
+                              ChangeSetType="UPDATE", TemplateBody=body)
+        return cfn.describe_change_set(ChangeSetName=name, StackName=stack_name)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template())
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        described = changes_of("depends-only", template(depends=True))
+        assert described["Status"] == "FAILED"
+        assert "didn't contain changes" in described["StatusReason"]
+
+        described = changes_of("retain", template(policy="Retain", depends=True))
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+        assert described["ExecutionStatus"] == "AVAILABLE"
+        assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]] == ["Queue"]
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Action"] == "Modify"
+        assert change["Replacement"] == "False"
+        assert sorted(change["Scope"]) == ["DeletionPolicy", "UpdateReplacePolicy"]
+        assert sorted(d["Target"]["Attribute"] for d in change["Details"]) == [
+            "DeletionPolicy", "UpdateReplacePolicy"]
+
+        cfn.execute_change_set(ChangeSetName="retain", StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        body = cfn.get_template(StackName=stack_name)["TemplateBody"]
+        stored = json.loads(body) if isinstance(body, str) else body
+        assert stored["Resources"]["Queue"]["DeletionPolicy"] == "Retain"
+
+        described = changes_of("metadata", template(policy="Retain", depends=True,
+                                                    metadata={"owner": "fleet"}))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Replacement"] == "False"
+        assert change["Scope"] == ["Metadata"]
+
+        described = changes_of("rename", template(policy="Retain", depends=True,
+                                                  queue_name=f"cfn-cs-attrs-{uid}-b"))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Scope"] == ["Properties"]
+        assert [d["Target"]["Name"] for d in change["Details"]] == ["QueueName"]
+        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Conditionally"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_execute_change_set_deletes_sibling_change_sets(cfn, ssm):
     """Executing a change set deletes the stack's other change sets — they are
     no longer valid for the updated stack (#1418)."""

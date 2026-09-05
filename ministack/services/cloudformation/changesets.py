@@ -258,12 +258,33 @@ def _describe_change_set(params):
     changes_xml = ""
     for ch in cs.get("Changes", []):
         rc = ch.get("ResourceChange", {})
+        scope_xml = "".join(f"<member>{_esc(a)}</member>" for a in rc.get("Scope", []))
+        details_xml = ""
+        for d in rc.get("Details", []):
+            target = d.get("Target", {})
+            target_xml = f"<Attribute>{_esc(target.get('Attribute', ''))}</Attribute>"
+            if target.get("Name"):
+                target_xml += f"<Name>{_esc(target['Name'])}</Name>"
+            if target.get("RequiresRecreation"):
+                target_xml += (
+                    f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
+                    "</RequiresRecreation>"
+                )
+            details_xml += (
+                "<member>"
+                f"<Target>{target_xml}</Target>"
+                f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
+                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                "</member>"
+            )
         changes_xml += (
             "<member><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"<Replacement>{rc.get('Replacement', '')}</Replacement>"
+            f"<Scope>{scope_xml}</Scope>"
+            f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
         )
 
