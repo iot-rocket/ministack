@@ -53,11 +53,9 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
-    DURABLE_CTX_EVENT_KEY,
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
-    INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
     ensure_spawned,
@@ -4096,6 +4094,14 @@ try {
       .filter(Boolean));
   const origHttpsRequest = https.request;
   https.request = function (input, options, callback) {
+    // Keep the caller's own arguments for the pass-through below: Node's
+    // ClientRequest reads (input, options, cb) positionally and, for a
+    // non-string input, takes cb from the SECOND argument — so replaying a
+    // normalised (input, undefined, callback) would drop the callback and the
+    // handler would never see its response. A copy, not `arguments` itself:
+    // this file is not in strict mode, so `arguments` stays aliased to the
+    // parameters and the normalisation below would rewrite it too.
+    const original = Array.prototype.slice.call(arguments);
     if (typeof options === "function") { callback = options; options = undefined; }
     let opts;
     if (typeof input === "string" || input instanceof URL) {
@@ -4111,7 +4117,7 @@ try {
     // port itself: a handler that dials its own TLS sidecar on another port
     // of localhost keeps TLS.
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
-      return origHttpsRequest.call(https, input, options, callback);
+      return origHttpsRequest.apply(https, original);
     }
     opts.protocol = "http:";
     opts.hostname = host;
@@ -4123,8 +4129,9 @@ try {
     delete opts._defaultAgent;
     return http.request(opts, callback);
   };
-  https.get = function (input, options, callback) {
-    const req = https.request(input, options, callback);
+  https.get = function () {
+    // Same argument shapes as request(), forwarded untouched.
+    const req = https.request.apply(https, arguments);
     req.end();
     return req;
   };
@@ -5079,25 +5086,19 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
         # worker's spawn env.
-        _xray = _xray_trace_id_for_invocation(config)
-        if _xray:
-            event["_x_amzn_trace_id"] = _xray
-        # Same channel for the recursive-loop depth: the worker's env is
-        # fixed at spawn time, so it has to ride in the event. Both worker
-        # bootstraps move it to the environment and drop the key before the
-        # handler runs. Non-dict payloads have nowhere to carry it, and lose
-        # the counter.
-        if isinstance(event, dict):
-            event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
-            # Durable executions ride the same channel: the ARN, the checkpoint
-            # token and the execution name differ per invocation, which is why
-            # they cannot be part of the worker's spawn environment. The
-            # bootstrap clears them again when the key is absent, so a worker
-            # reused for a non-durable call does not see the previous one's.
-            durable = _durable_env_overlay()
-            if durable:
-                event[DURABLE_CTX_EVENT_KEY] = durable
-        result = worker.invoke(event, new_uuid())
+        # The per-invocation values travel beside the payload, never inside
+        # it: on AWS the trace header is a reserved environment variable that
+        # "changes with each invocation", the request id is on the context
+        # object, and the payload the handler receives is the caller's, of
+        # whatever JSON type. A pooled worker's spawn environment is fixed, so
+        # the values ride the envelope and the bootstrap applies them per call.
+        result = worker.invoke(
+            event,
+            new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+            depth=_invoke_depth.get(),
+            durable=_durable_env_overlay(),
+        )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
@@ -5207,10 +5208,14 @@ def _execute_function_provided_warm(func: dict, event: dict,
         account, region = _account_region_from_function_config(config)
         invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
         worker = None  # invalidation already removed and reaped the worker
+        # A Python class name is not an AWS error type: a bootstrap that is
+        # missing or cannot be executed is `Runtime.InvalidEntrypoint`, and the
+        # environment failures AWS names Runtime.* carry their own type.
+        error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
         # Do not transparently invoke again: the handler may already have
         # performed side effects before its environment failed.
         return {
-            "body": {"errorMessage": str(e), "errorType": type(e).__name__},
+            "body": {"errorMessage": str(e), "errorType": error_type},
             "error": True,
             "log": "",
         }
