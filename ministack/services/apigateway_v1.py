@@ -2456,22 +2456,39 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
 def _invoke_mock_v1(integration):
     """Return a MOCK integration response.
 
-    Selection: iterate integrationResponses in status-code order; the first
-    entry whose selectionPattern is empty (default) or matches "200" is used,
-    matching AWS behaviour for MOCK where the input is always treated as
-    successful (statusCode 200).
+    The request template's ``statusCode`` (200 when absent) is the integration
+    status: the response whose selectionPattern matches it is used, else an
+    explicit "200" entry, else the entry with an empty (default) pattern.
     """
     int_responses = integration.get("integrationResponses", {})
     if not int_responses:
         return 200, {"Content-Type": "application/json"}, b"{}"
 
-    # AWS selects the response whose selectionPattern matches the integration
-    # status code.  For MOCK the "status" is always 200 (success path).
+    template = (integration.get("requestTemplates") or {}).get("application/json") or ""
+    match = re.search(r'"statusCode"\s*:\s*(\d{3})', template)
+    status_code = match.group(1) if match else "200"
     selected = None
-    # Prefer an explicit "200" entry first
-    if "200" in int_responses:
+    matches = []
+    for resp in int_responses.values():
+        pattern = resp.get("selectionPattern")
+        try:
+            if pattern and re.fullmatch(pattern, status_code):
+                matches.append(resp)
+        except re.error:
+            continue
+    # Several patterns can match; the entry whose own status code is the
+    # integration status wins, so a catch-all on another entry does not
+    # shadow the exact one.
+    for resp in matches:
+        if str(resp.get("statusCode")) == status_code:
+            selected = resp
+            break
+    if selected is None and matches:
+        selected = matches[0]
+    if selected is None and "200" in int_responses:
+        # Prefer an explicit "200" entry
         selected = int_responses["200"]
-    else:
+    elif selected is None:
         # Fall back to the entry with an empty / catch-all selectionPattern
         for resp in int_responses.values():
             pattern = resp.get("selectionPattern", "")

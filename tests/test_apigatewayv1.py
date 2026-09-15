@@ -4495,8 +4495,9 @@ _GWRESP_MISSING_FN = "v1-gwresp-does-not-exist"
 
 @pytest.fixture(scope="module")
 def gwresp_api(apigw_v1, lam):
-    """A deployed API (stage s1, variable sv) serving MOCK /mock, TOKEN-guarded
-    /auth/{x}, AWS_IAM /iam and an AWS_PROXY /nolambda naming a missing function."""
+    """A deployed API (stage s1, variable sv) serving MOCK /mock and /mock500,
+    TOKEN-guarded /auth/{x}, AWS_IAM /iam and an AWS_PROXY /nolambda naming a
+    missing function."""
     authz = _auth_make_lambda(lam, "gwresp", _GWRESP_AUTHORIZER)
     api_id = apigw_v1.create_rest_api(name=f"v1-gwresp-{_uuid_mod.uuid4().hex[:6]}")["id"]
     root_id = _auth_root_id(apigw_v1, api_id)
@@ -4505,17 +4506,21 @@ def gwresp_api(apigw_v1, lam):
         identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
     )["id"]
 
-    def mock(path_part, parent=root_id, **method_kwargs):
+    def mock(path_part, parent=root_id, status="200", **method_kwargs):
         rid = apigw_v1.create_resource(restApiId=api_id, parentId=parent, pathPart=path_part)["id"]
         method_kwargs.setdefault("authorizationType", "NONE")
         apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", **method_kwargs)
         apigw_v1.put_integration(
             restApiId=api_id, resourceId=rid, httpMethod="GET", type="MOCK",
-            requestTemplates={"application/json": '{"statusCode": 200}'},
+            requestTemplates={"application/json": f'{{"statusCode": {status}}}'},
         )
         apigw_v1.put_integration_response(
             restApiId=api_id, resourceId=rid, httpMethod="GET", statusCode="200",
             responseTemplates={"application/json": '{"ok":true}'},
+        )
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", statusCode="500", selectionPattern="500",
+            responseTemplates={"application/json": '{"mock":"500"}'},
         )
         return rid
 
@@ -4529,6 +4534,7 @@ def gwresp_api(apigw_v1, lam):
     )["id"]
 
     mock("mock")
+    mock("mock500", status="500")
     auth_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="auth")["id"]
     mock("{x}", parent=auth_id, authorizationType="CUSTOM", authorizerId=authorizer_id)
     req_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="req")["id"]
@@ -4580,6 +4586,8 @@ _GWRESP_DENY = "User is not authorized to access this resource with an explicit 
     "path,headers,status,response_type,error_type,builtin_body",
     [
         ("mock", {}, 200, None, None, b'{"ok":true}'),
+        # The MOCK request template's statusCode selects the integration response.
+        ("mock500", {}, 500, None, None, b'{"mock":"500"}'),
         ("nope", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
          b'{"message":"Missing Authentication Token"}'),
         ("iam", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
