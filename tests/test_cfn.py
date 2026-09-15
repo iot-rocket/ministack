@@ -13800,12 +13800,15 @@ def test_cfn_logs_subscription_filter_updates_in_place(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs):
+@pytest.mark.parametrize("rollback", [False, True])
+def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs, rollback):
     """LogGroupName requires replacement: the filter is created on the new
     group and removed from the old one. The filter keeps its explicit
     FilterName, so the physical id does not change; without an update
     handler the create wrote the new filter and the old group kept its
-    copy, since the engine saw no replacement to clean up."""
+    copy, since the engine saw no replacement to clean up. When a later
+    resource fails the update, the rollback removes the new filter and the
+    old one stays on its group."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-subfilter-move-{uid}"
     group_a = f"/cfn/subfilter-upd-a-{uid}"
@@ -13822,14 +13825,19 @@ def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
 
-        cfn.update_stack(StackName=stack_name,
-                         TemplateBody=_cfn_subfilter_template(uid, filter_props("GroupB")))
+        body = json.loads(_cfn_subfilter_template(uid, filter_props("GroupB")))
+        if rollback:
+            body["Resources"]["Bad"] = {"Type": "AWS::SSM::Parameter", "DependsOn": "Filter",
+                                        "Properties": {"Type": "Bogus", "Value": "v"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
         stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        expected = "UPDATE_ROLLBACK_COMPLETE" if rollback else "UPDATE_COMPLETE"
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
         assert _output(stack, "FilterRef") == f"cfn-move-{uid}"
-        assert logs.describe_subscription_filters(logGroupName=group_a)["subscriptionFilters"] == []
-        moved = logs.describe_subscription_filters(logGroupName=group_b)["subscriptionFilters"]
-        assert [f["filterName"] for f in moved] == [f"cfn-move-{uid}"]
+        kept, moved = (group_a, group_b) if rollback else (group_b, group_a)
+        filters = logs.describe_subscription_filters(logGroupName=kept)["subscriptionFilters"]
+        assert [(f["filterName"], f["filterPattern"]) for f in filters] == [(f"cfn-move-{uid}", "[Producer]")]
+        assert logs.describe_subscription_filters(logGroupName=moved)["subscriptionFilters"] == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -20257,8 +20265,7 @@ def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_stateme
     """When an update that replaced the permission fails later in the run,
     the rollback removes the statement the replacement added, since the
     delete resolves the Sid the way the create did. The previous statement
-    is not re-added: the rollback restores the stack record without
-    re-provisioning, which is disclosed in the PR."""
+    stays: its removal waits for the cleanup phase of a successful update."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-perm-rb-{uid}"
     fn_name = f"cfn-perm-rb-{uid}"
@@ -20296,8 +20303,7 @@ def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_stateme
         cfn.update_stack(StackName=stack_name, TemplateBody=template("events.amazonaws.com", "N"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        statements = _lambda_policy_statements(lam, fn_name)
-        assert {s["Sid"] for s in statements} == {"kept"}
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == sids
         assert ddb.describe_table(TableName=table_name)["Table"]["AttributeDefinitions"] == [
             {"AttributeName": "pk", "AttributeType": "S"}]
     finally:
@@ -21308,36 +21314,30 @@ def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, d
         sqs.get_queue_url(QueueName=queue_name)
 
 
-def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record(cfn, sqs, ddb):
-    """A resource replaced under a new physical id during a failed update has
-    the replacement deleted on rollback, and the restored stack record points
-    at the old physical id again. The queue is renamed, which is a replacement
-    (QueueName is create-only); the table, whose attribute type change is
-    refused under its custom name, is what fails the update.
+def test_cfn_update_rollback_deletes_the_replacement_and_keeps_the_old_resource(cfn, sqs, ssm, ddb):
+    """A resource replaced during a failed update has the replacement deleted
+    on rollback and the old resource kept, and the restored stack record
+    points at it again. The queue and the parameter are renamed (both names
+    are create-only); the table, whose attribute type change is refused under
+    its custom name, is what fails the update. A later successful update
+    deletes the predecessors in the cleanup phase.
 
-    AWS, "Understand update behaviors of stack resources": a replacement
-    "recreates the resource during an update, which also generates a new
-    physical ID. CloudFormation usually creates the replacement resource
-    first, changes references from other dependent resources to point to the
-    replacement resource, and then deletes the old resource." And on a failed
-    operation ("Managing AWS resources as a single unit"): "CloudFormation
-    rolls the stack back and automatically deletes any resources that were
-    created."
-
-    The emulator's replacement deletes the old queue as soon as the new one
-    exists, so the rollback cannot bring it back: the restored record names a
-    queue that no longer exists. That is the disclosed limit this test pins.
+    Measured on AWS 2026-09-15 with a renamed SSM parameter and a resource
+    failing after it: the new parameter is deleted in
+    UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS and the old one survives.
     """
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-rb-replace-{uid}"
-    old_name = f"cfn-rb-old-{uid}"
-    new_name = f"cfn-rb-new-{uid}"
+    old_name, new_name = f"cfn-rb-old-{uid}", f"cfn-rb-new-{uid}"
+    old_param, new_param = f"/cfn-rb-{uid}/old", f"/cfn-rb-{uid}/new"
     table_name = f"cfn-rb-replace-{uid}"
 
-    def template(queue_name, key_type):
+    def template(queue_name, param_name, key_type):
         return json.dumps({"Resources": {
             "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
-            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+            "Param": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": param_name, "Type": "String", "Value": "v"}},
+            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": ["Queue", "Param"], "Properties": {
                 "TableName": table_name,
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -21345,33 +21345,48 @@ def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record
             }},
         }})
 
-    cfn.create_stack(StackName=stack_name, TemplateBody=template(old_name, "S"))
+    def param_exists(name):
+        try:
+            ssm.get_parameter(Name=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ParameterNotFound", exc.response["Error"]
+            return False
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(old_name, old_param, "S"))
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         old_url = sqs.get_queue_url(QueueName=old_name)["QueueUrl"]
+        new_url = f"{old_url.rsplit('/', 1)[0]}/{new_name}"
 
-        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, "N"))
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, new_param, "N"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        events = [e for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
-                  if e["LogicalResourceId"] == "Queue"]
-        deleted = [e for e in events if e["ResourceStatus"] == "DELETE_COMPLETE"]
-        assert [e["PhysicalResourceId"] for e in deleted] == [f"{old_url.rsplit('/', 1)[0]}/{new_name}"]
-
-        with pytest.raises(ClientError):
-            sqs.get_queue_url(QueueName=new_name)
-        with pytest.raises(ClientError):  # the replacement already removed it; not restored
-            sqs.get_queue_url(QueueName=old_name)
-        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(
-            StackName=stack_name)["StackResources"]}
-        assert set(resources) == {"Queue", "Table"}
-        assert resources["Queue"]["PhysicalResourceId"] == old_url
-        assert resources["Table"]["PhysicalResourceId"] == table_name
+        for logical_id, new_pid in (("Queue", new_url), ("Param", new_param)):
+            deleted = [pid for status, pid in _resource_events(cfn, stack_name, logical_id)
+                       if status.startswith("DELETE")]
+            assert deleted == [new_pid], (logical_id, deleted)
+        assert _queue_exists(sqs, old_name) and not _queue_exists(sqs, new_name)
+        assert param_exists(old_param) and not param_exists(new_param)
+        resources = {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                     for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert resources == {"Queue": old_url, "Param": old_param, "Table": table_name}
         table = ddb.describe_table(TableName=table_name)["Table"]
         assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, new_param, "S"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, new_name) and not _queue_exists(sqs, old_name)
+        assert param_exists(new_param) and not param_exists(old_param)
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+        for name in (old_name, new_name):
+            _delete_queue_if_present(sqs, name)
+        ssm.delete_parameters(Names=[old_param, new_param])
+
+
 def _queue_exists(sqs, name):
     try:
         sqs.get_queue_url(QueueName=name)

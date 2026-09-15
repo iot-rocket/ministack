@@ -737,6 +737,12 @@ def _requires_replacement(resource_type, old_props, new_props):
 # replaces the resource must then leave the predecessor in place; the engine
 # records the DELETE_SKIPPED event.
 _RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+# Set by the stack engine to a list around an update handler: a predecessor
+# delete is then queued there and run in the cleanup phase after the update
+# succeeds, so a rollback still finds the old resource. Unset (None), the
+# delete runs at once.
+_DEFERRED_PREDECESSOR_DELETES = contextvars.ContextVar(
+    "cfn_deferred_predecessor_deletes", default=None)
 # The DeletionPolicy / UpdateReplacePolicy values that keep a resource; the
 # engine reads the same tuple for the cleanup phase and the stack delete.
 # Snapshot is not among them: the emulator takes no snapshots, so a Snapshot
@@ -788,6 +794,10 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     apply.
     """
     if _RETAIN_REPLACED.get():
+        return
+    deferred = _DEFERRED_PREDECESSOR_DELETES.get()
+    if deferred is not None:
+        deferred.append((delete_fn, args, kwargs))
         return
     delete_fn(*args, **kwargs)
 
@@ -3826,12 +3836,16 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                     res_def, "UpdateReplacePolicy", provisioned, param_values,
                     conditions, mappings, child_name, child_stack_id,
                 ) in _RETAINING_POLICIES)
+                # The child has no cleanup phase of its own: its handlers
+                # delete the predecessor at once, not into the parent's queue.
+                deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(None)
                 try:
                     physical_id, attrs = _update_resource(
                         resource_type, prev.get("PhysicalResourceId", child_logical_id),
                         old_tagged, new_tagged, child_name, child_logical_id,
                     )
                 finally:
+                    _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
             else:
                 physical_id, attrs = _provision_resource(
