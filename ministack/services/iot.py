@@ -5001,6 +5001,25 @@ def _validate_publish_topic(topic: str) -> bool:
     return True
 
 
+# The reserved topic space a client may publish into. AWS closes the connection
+# of an MQTT client that publishes to any other topic starting with ``$``
+# (measured for ``$aws/events/...``, ``$aws/jobs/...`` and ``$foo/...``; a
+# publish under ``$aws/rules/`` and ``$aws/things/`` is acknowledged). The HTTPS
+# Publish in iot_data.py applies the same list and answers 400.
+RESERVED_PUBLISH_PREFIXES = (
+    "$aws/rules/",
+    "$aws/things/",
+    "$aws/certificates/",
+    "$aws/provisioning-templates/",
+    "$aws/device_location/",
+    "$aws/commands/",
+)
+
+
+def _reserved_topic_publish_allowed(topic: str) -> bool:
+    return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
+
+
 # ---------------------------------------------------------------------------
 # Broker public API (consumed by iot_data.py and handle_websocket)
 # ---------------------------------------------------------------------------
@@ -6945,6 +6964,13 @@ class _WSSession:
                 _broker_logger.warning("IoT broker: PUBLISH rejected — invalid topic: %r", topic)
                 if self.protocol_version == MQTT_5:
                     await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
+                return False
+            if not _reserved_topic_publish_allowed(topic):
+                # AWS closes the connection without a PUBACK (measured over
+                # MQTT 3.1.1; the MQTT 5 reason code is not measured).
+                _broker_logger.warning("IoT broker: PUBLISH to a reserved topic closes the connection: %r", topic)
+                if self.protocol_version == MQTT_5:
+                    await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
                 return False
             payload = body[off:]
             delivered = await broker_publish(

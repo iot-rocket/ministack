@@ -111,6 +111,39 @@ def test_iot_data_publish_oversized_topic_400():
         assert e.code == 400
 
 
+_NO_DOLLAR = "Topic can't start with $"
+_MQTT_ONLY = "Invalid publish to restricted topic using HTTP"
+
+
+@pytest.mark.parametrize(
+    ("topic", "message"),
+    [
+        ("$aws/events/certificates/registered/x", _NO_DOLLAR),
+        ("$AWS/events/certificates/registered/x", _NO_DOLLAR),
+        ("$aws/jobs/x", _NO_DOLLAR),
+        ("$aws/rules", _NO_DOLLAR),
+        ("$foo/bar", _NO_DOLLAR),
+        ("$aws/things/t1/jobs/get", _MQTT_ONLY),
+        ("$aws/things/t1/defender/metrics/json", _MQTT_ONLY),
+        ("$aws/commands/things/t1/executions/1/response/json", _MQTT_ONLY),
+        ("$aws/rules/no_such_rule/x", None),
+        ("$aws/things/t1/jobs", None),
+    ],
+)
+def test_iot_data_publish_reserved_topics(iot_data_client, topic, message):
+    """HTTPS Publish to a "$" topic is refused outside the reserved families
+    and for the MQTT-only jobs, Device Defender and commands topics."""
+    if message is None:
+        resp = iot_data_client.publish(topic=topic, payload=b"{}")
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+        return
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.publish(topic=topic, payload=b"{}")
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
 # ---------------------------------------------------------------------------
 # MQTT-over-WebSocket round-trip
 # ---------------------------------------------------------------------------
@@ -1369,6 +1402,8 @@ def test_search_index_connectivity_is_isolated_across_accounts_and_regions():
     finally:
         owner.delete_thing(thingName=thing)
         owner_eu.delete_thing(thingName=thing)
+
+
 # ---------------------------------------------------------------------------
 # Topic-rule `sqs` action (publish → rule → SQS queue)
 # ---------------------------------------------------------------------------
@@ -2471,6 +2506,33 @@ def test_mqtt5_qos1_puback_carries_reason_code():
     lonely, matched = _run(scenario())
     assert lonely == b"\x00\x07\x10\x00", "packet id 7, No matching subscribers, no properties"
     assert matched == b"\x00\x08\x00\x00", "packet id 8, Success, no properties"
+
+
+@pytest.mark.parametrize("topic,acknowledged", [
+    ("$aws/rules/no-such-rule/x", True),
+    ("$aws/things/some-thing/shadow/update", True),
+    ("$aws/events/certificates/registered/abc", False),
+    ("$aws/jobs/abc", False),
+    ("$foo/abc", False),
+], ids=["rules", "shadow", "events", "jobs", "other-dollar"])
+def test_mqtt_publish_to_reserved_topic_closes_the_connection(topic, acknowledged):
+    """AWS acknowledges a publish under $aws/rules/ and $aws/things/ and closes
+    the connection of a client that publishes to any other $ topic (measured
+    over MQTT 3.1.1); the HTTPS Publish applies the same list."""
+
+    async def scenario():
+        async with _connect(MQTT_311) as (pub, _c):
+            await pub.send(_make_publish(topic, b"x", qos=1, packet_id=5))
+            try:
+                _flags, body = await pub.await_packet(PKT_PUBACK, timeout=3)
+                return ("puback", body)
+            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                return ("closed", type(e).__name__)
+
+    kind, detail = _run(scenario())
+    assert kind == ("puback" if acknowledged else "closed"), (kind, detail)
+    if acknowledged:
+        assert detail == b"\x00\x05"
 
 
 def test_mqtt311_qos1_puback_stays_two_bytes():
