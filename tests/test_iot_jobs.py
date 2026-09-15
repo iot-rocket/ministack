@@ -447,9 +447,8 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
 # ---------------------------------------------------------------------------
 
 
-def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
-    """The documented device flow: `DescribeEndpoint(endpointType='iot:Jobs')`
-    hands out `{prefix}.jobs.iot.{region}`, and a request carrying that Host
+def test_iot_jobs_endpoint_host_reaches_the_data_plane(iot_client):
+    """A request carrying the jobs endpoint Host `{prefix}.jobs.iot.{region}`
     must land on the jobs data plane. Routed to the `iot` control plane
     instead, `GET /things/{t}/jobs` is ListJobExecutionsForThing and silently
     answers a different envelope."""
@@ -459,10 +458,7 @@ def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
         thing_arn = _create_thing(iot_client, thing)
         iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
 
-        endpoint = iot_client.describe_endpoint(endpointType="iot:Jobs")[
-            "endpointAddress"
-        ]
-        assert ".jobs.iot." in endpoint
+        endpoint = "a1b2c3.jobs.iot.us-east-1.localhost"
         request = urllib.request.Request(
             f"{ENDPOINT}/things/{quote(thing)}/jobs",
             method="GET",

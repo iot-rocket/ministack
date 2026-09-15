@@ -605,6 +605,17 @@ async def handle_request(
 # ---------------------------------------------------------------------------
 
 
+# AWS refuses the legacy endpoint types; the jobs data plane is served from
+# the iot:Data-ATS endpoint.
+_RETIRED_ENDPOINT_TYPES = {
+    "iot:Data": "iot:Data is not supported. Please use iot:Data-ATS instead.",
+    "iot:Jobs": (
+        "IoT Jobs and Commands APIs are now available through iot:Data-ATS "
+        "endpoints instead of iot:Jobs endpoints. Please use iot:Data-ATS."
+    ),
+}
+
+
 def _describe_endpoint(qp: dict) -> tuple:
     """Return a per-account endpoint hostname.
 
@@ -618,13 +629,14 @@ def _describe_endpoint(qp: dict) -> tuple:
     prefix = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
     region = get_region()
 
-    if endpoint_type in ("iot:Data-ATS", "iot:Data", None):
-        suffix = "-ats" if endpoint_type != "iot:Data" else ""
-        host = f"{prefix}{suffix}.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    if endpoint_type in _RETIRED_ENDPOINT_TYPES:
+        return error_response_json(
+            "InvalidRequestException", _RETIRED_ENDPOINT_TYPES[endpoint_type], 400
+        )
+    if endpoint_type == "iot:Data-ATS":
+        host = f"{prefix}-ats.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
     elif endpoint_type == "iot:CredentialProvider":
         host = f"{prefix}.credentials.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
-    elif endpoint_type == "iot:Jobs":
-        host = f"{prefix}.jobs.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
     else:
         return error_response_json(
             "InvalidRequestException",

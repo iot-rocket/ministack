@@ -36,12 +36,23 @@ def test_iot_describe_endpoint_default_uses_data_ats(iot_client):
     assert "-ats.iot." in resp["endpointAddress"]
 
 
-def test_iot_describe_endpoint_data_legacy(iot_client):
-    resp = iot_client.describe_endpoint(endpointType="iot:Data")
-    addr = resp["endpointAddress"]
-    # Legacy endpoint omits the -ats suffix.
-    assert ".iot." in addr
-    assert "-ats.iot." not in addr
+@pytest.mark.parametrize(
+    ("endpoint_type", "message"),
+    [
+        ("iot:Data", "iot:Data is not supported. Please use iot:Data-ATS instead."),
+        (
+            "iot:Jobs",
+            "IoT Jobs and Commands APIs are now available through iot:Data-ATS "
+            "endpoints instead of iot:Jobs endpoints. Please use iot:Data-ATS.",
+        ),
+    ],
+)
+def test_iot_describe_endpoint_retired_types_rejected(iot_client, endpoint_type, message):
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_endpoint(endpointType=endpoint_type)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_iot_describe_endpoint_unknown_type_rejected(iot_client):
