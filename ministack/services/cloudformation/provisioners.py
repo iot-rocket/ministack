@@ -929,6 +929,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
     "AWS::DynamoDB::Table": ("Tags", "list"),
     "AWS::EC2::VPCEndpoint": ("Tags", "list"),
+    "AWS::ECR::Repository": ("Tags", "list"),
     "AWS::ECS::Cluster": ("Tags", "list"),
     "AWS::ECS::Service": ("Tags", "list"),
     "AWS::EKS::Cluster": ("Tags", "list"),
@@ -6203,25 +6204,71 @@ def _cognito_user_pool_domain_delete(physical_id, props):
 # ===========================================================================
 # --- ECR resource provisioners ---
 
+def _ecr_cfn_to_api(props):
+    """The ``CreateRepository`` members an ``AWS::ECR::Repository`` declares,
+    in the API's casing and shapes: the store keeps what the API writes, and
+    ``DescribeRepositories`` and ``ListTagsForResource`` answer it verbatim.
+    A member the template leaves out takes the API's default."""
+    scanning = props.get("ImageScanningConfiguration") or {}
+    encryption = props.get("EncryptionConfiguration") or {}
+    encryption_config = {"encryptionType": encryption.get("EncryptionType", "AES256")}
+    if encryption.get("KmsKey"):
+        encryption_config["kmsKey"] = encryption["KmsKey"]
+    return {
+        "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
+        "imageScanningConfiguration": {
+            "scanOnPush": str(scanning.get("ScanOnPush", False)).lower() == "true",
+        },
+        "encryptionConfiguration": encryption_config,
+        "tags": [{"Key": t["Key"], "Value": t.get("Value", "")}
+                 for t in props.get("Tags") or [] if isinstance(t, dict) and "Key" in t],
+    }
+
+
+def _ecr_repo_apply_policies(name, props):
+    """Write the lifecycle policy and the repository policy through the ECR
+    calls that own them, and remove one the template no longer declares."""
+    lifecycle = (props.get("LifecyclePolicy") or {}).get("LifecyclePolicyText")
+    if lifecycle:
+        _ecr._put_lifecycle_policy({"repositoryName": name, "lifecyclePolicyText": lifecycle})
+    else:
+        _ecr._lifecycle_policies.pop(name, None)
+    policy = props.get("RepositoryPolicyText")
+    if policy:
+        _ecr._set_repository_policy({
+            "repositoryName": name,
+            "policyText": policy if isinstance(policy, str) else json.dumps(policy),
+        })
+    else:
+        _ecr._repo_policies.pop(name, None)
+
+
 def _ecr_repo_create(logical_id, props, stack_name):
     name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
-    arn = f"arn:aws:ecr:{get_region()}:{get_account_id()}:repository/{name}"
-    _ecr._repositories[name] = {
-        "repositoryName": name,
-        "repositoryArn": arn,
-        "registryId": get_account_id(),
-        "repositoryUri": f"{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/{name}",
-        "createdAt": __import__("time").time(),
-        "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
-        "imageScanningConfiguration": props.get("ImageScanningConfiguration", {"scanOnPush": False}),
-        "encryptionConfiguration": props.get("EncryptionConfiguration", {"encryptionType": "AES256"}),
-        "images": [],
-    }
-    return name, {"Arn": arn, "RepositoryUri": _ecr._repositories[name]["repositoryUri"]}
+    api = _ecr_cfn_to_api(props)
+    if name in _ecr._repositories:
+        # The create has always overwritten an existing record; refusing the
+        # duplicate is a separate change.
+        _ecr._repositories[name].update(api)
+    else:
+        _ecr._create_repository({"repositoryName": name, **api})
+    _ecr_repo_apply_policies(name, props)
+    repo = _ecr._repositories[name]
+    return name, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
 
 
 def _ecr_repo_delete(physical_id, props):
-    _ecr._repositories.pop(physical_id, None)
+    """Delete through ``DeleteRepository``, which drops the images and both
+    policies with the repository and refuses one that still holds images
+    unless ``EmptyOnDelete`` is true."""
+    if physical_id not in _ecr._repositories:
+        return
+    status, _, body = _ecr._delete_repository({
+        "repositoryName": physical_id,
+        "force": str(props.get("EmptyOnDelete", False)).lower() == "true",
+    })
+    if status >= 400:
+        raise ValueError(json.loads(body).get("message", body))
 
 
 # --- CodeBuild Project provisioner ---
@@ -10076,11 +10123,20 @@ def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
     repo = _ecr._repositories.get(physical_id)
     new_name = new_props.get("RepositoryName")
     if repo is None or (new_name and new_name != physical_id):
-        return _ecr_repo_create(physical_id, new_props, stack_name)
-    for prop, key in (("ImageTagMutability", "imageTagMutability"),
-                      ("ImageScanningConfiguration", "imageScanningConfiguration")):
-        if prop in new_props:
-            repo[key] = new_props[prop]
+        # A new name is a replacement: create the new repository, then delete
+        # the old one through DeleteRepository, unless the template retains it.
+        result = _ecr_repo_create(physical_id, new_props, stack_name)
+        if repo is not None:
+            _delete_predecessor(_ecr_repo_delete, physical_id, old_props)
+        return result
+    # ImageTagMutability, ImageScanningConfiguration, LifecyclePolicy,
+    # RepositoryPolicyText and Tags update in place; EncryptionConfiguration
+    # requires replacement and stays as it is.
+    api = _ecr_cfn_to_api(new_props)
+    repo["imageTagMutability"] = api["imageTagMutability"]
+    repo["imageScanningConfiguration"] = api["imageScanningConfiguration"]
+    _reconcile_tag_list(repo.setdefault("tags", []), old_props, new_props)
+    _ecr_repo_apply_policies(physical_id, new_props)
     return physical_id, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
 
 

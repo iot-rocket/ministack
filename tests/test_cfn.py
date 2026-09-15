@@ -5524,6 +5524,152 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
 
     cfn.delete_stack(StackName="CDKToolkit-v44")
 
+
+def _cfn_ecr_template(name, *, v2=False, policies=True, empty_on_delete=None):
+    props = {
+        "RepositoryName": name,
+        "ImageTagMutability": "MUTABLE" if v2 else "IMMUTABLE",
+        "ImageScanningConfiguration": {"ScanOnPush": not v2},
+        "EncryptionConfiguration": {"EncryptionType": "AES256"},
+        "Tags": [{"Key": "stage", "Value": "v2" if v2 else "v1"}]
+        + ([] if v2 else [{"Key": "dropme", "Value": "x"}]),
+    }
+    if policies:
+        props["LifecyclePolicy"] = {"LifecyclePolicyText": json.dumps({"rules": [{
+            "rulePriority": 1, "selection": {
+                "tagStatus": "untagged", "countType": "sinceImagePushed",
+                "countUnit": "days", "countNumber": 30 if v2 else 14},
+            "action": {"type": "expire"}}]})}
+        props["RepositoryPolicyText"] = {"Version": "2012-10-17", "Statement": [{
+            "Sid": "pull", "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+            "Action": ["ecr:BatchGetImage"]}]}
+    if empty_on_delete is not None:
+        props["EmptyOnDelete"] = empty_on_delete
+    return json.dumps({"Resources": {"Repo": {"Type": "AWS::ECR::Repository",
+                                              "Properties": props}}})
+
+
+def _ecr_lifecycle_days(ecr, name):
+    text = ecr.get_lifecycle_policy(repositoryName=name)["lifecyclePolicyText"]
+    return json.loads(text)["rules"][0]["selection"]["countNumber"]
+
+
+def test_cfn_ecr_repository_reads_back_and_updates_in_place(cfn, ecr):
+    """Every property reads back through the ECR API as the API writes it:
+    the scanning and encryption settings in camelCase, the lifecycle and
+    repository policies from their own calls, the tags with the three
+    aws:cloudformation tags. An update applies all but the encryption in
+    place, keeps createdAt, removes a dropped tag and a dropped policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-ecr-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(name))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        repo = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
+        assert repo["imageTagMutability"] == "IMMUTABLE"
+        assert repo["imageScanningConfiguration"] == {"scanOnPush": True}
+        assert repo["encryptionConfiguration"] == {"encryptionType": "AES256"}
+        assert _ecr_lifecycle_days(ecr, name) == 14
+        policy = json.loads(ecr.get_repository_policy(repositoryName=name)["policyText"])
+        assert policy["Statement"][0]["Sid"] == "pull"
+        tags = {t["Key"]: t["Value"] for t in ecr.list_tags_for_resource(
+            resourceArn=repo["repositoryArn"])["tags"]}
+        assert tags == {"stage": "v1", "dropme": "x", **_system_tags(stack, "Repo")}
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_ecr_template(name, v2=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        after = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
+        assert after["createdAt"] == repo["createdAt"]
+        assert after["imageTagMutability"] == "MUTABLE"
+        assert after["imageScanningConfiguration"] == {"scanOnPush": False}
+        assert _ecr_lifecycle_days(ecr, name) == 30
+        tags = {t["Key"]: t["Value"] for t in ecr.list_tags_for_resource(
+            resourceArn=repo["repositoryArn"])["tags"]}
+        assert tags == {"stage": "v2", **_system_tags(stack, "Repo")}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(
+            name, v2=True, policies=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError, match="LifecyclePolicyNotFoundException"):
+            ecr.get_lifecycle_policy(repositoryName=name)
+        with pytest.raises(ClientError, match="RepositoryPolicyNotFoundException"):
+            ecr.get_repository_policy(repositoryName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("empty_on_delete", [None, True])
+def test_cfn_ecr_repository_takes_images_and_deletes_like_the_api(
+        cfn, ecr, empty_on_delete):
+    """A stack's repository accepts PutImage. Deleting the stack goes through
+    DeleteRepository: a repository with images fails the delete unless
+    EmptyOnDelete is true, and a deleted one leaves no images or policies
+    behind for a repository created later under the same name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-ecr-del-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(
+        name, empty_on_delete=empty_on_delete))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ecr.put_image(repositoryName=name, imageTag="v1",
+                      imageManifest='{"schemaVersion": 2}')
+        assert len(ecr.describe_images(repositoryName=name)["imageDetails"]) == 1
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        if empty_on_delete is None:
+            assert stack["StackStatus"] == "DELETE_FAILED"
+            assert f"The repository with name '{name}' is not empty" in \
+                _stack_event_reasons(cfn, stack_name)
+            assert len(ecr.describe_images(repositoryName=name)["imageDetails"]) == 1
+            ecr.delete_repository(repositoryName=name, force=True)
+            return
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        ecr.create_repository(repositoryName=name)
+        try:
+            assert ecr.describe_images(repositoryName=name)["imageDetails"] == []
+            with pytest.raises(ClientError, match="LifecyclePolicyNotFoundException"):
+                ecr.get_lifecycle_policy(repositoryName=name)
+            with pytest.raises(ClientError, match="RepositoryPolicyNotFoundException"):
+                ecr.get_repository_policy(repositoryName=name)
+        finally:
+            ecr.delete_repository(repositoryName=name, force=True)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ecr_repository_rename_deletes_the_old_repository(cfn, ecr):
+    """RepositoryName is create-only: a new name creates the new repository
+    and deletes the old one through DeleteRepository once the update succeeds."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecr-ren-{uid}"
+    old_name, new_name = f"cfn-ecr-old-{uid}", f"cfn-ecr-new-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(old_name))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(new_name))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        names = {r["repositoryName"] for r in ecr.describe_repositories()["repositories"]}
+        assert new_name in names and old_name not in names
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (old_name, new_name):
+            try:
+                ecr.delete_repository(repositoryName=name, force=True)
+            except ClientError:
+                pass
+
+
 def test_cfn_ec2_launch_template(cfn, ec2):
     """CloudFormation should provision and delete an EC2 LaunchTemplate."""
     template = {
