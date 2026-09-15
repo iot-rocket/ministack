@@ -1386,24 +1386,22 @@ def _header_ci(headers, name):
 class _GatewayError:
     """An error API Gateway itself emits, answered through the gateway response
     of ``response_type`` in the stage's deployment (see
-    :func:`_gateway_error_response`). ``status`` overrides the type's default
-    status when no customized response applies."""
+    :func:`_gateway_error_response`)."""
 
-    def __init__(self, response_type, message, status=None):
+    def __init__(self, response_type, message):
         self.response_type = response_type
         self.message = message
-        self.status = status
 
 
-def _gw_error(response_type, message, status=None):
-    return _GatewayError(response_type, message, status)
+def _gw_error(response_type, message):
+    return _GatewayError(response_type, message)
 
 
 def _deny_error(explicit):
     """The 403 an authorizer denial produces. Explicit Deny vs. no-matching-Allow
     differ only in the trailing clause."""
     msg = (
-        "User is not authorized to access this resource with an explicit deny"
+        "User is not authorized to access this resource with an explicit deny in an identity-based policy"
         if explicit
         else "User is not authorized to access this resource"
     )
@@ -1454,13 +1452,9 @@ def _gateway_error_response(error, request):
     response_type = error.response_type
     response = _gateway_response_for_type(customized, response_type)
     template = (response.get("responseTemplates") or {}).get("application/json")
-    if response_type in customized:
-        status = response.get("statusCode")
-    else:
-        status = error.status or response.get("statusCode")
-        if _gateway_response_family(response_type) not in customized and response_type == "ACCESS_DENIED":
-            # The built-in ACCESS_DENIED body carries a capitalised `Message` key.
-            template = '{"Message":$context.error.messageString}'
+    if response_type == "ACCESS_DENIED" and not customized.keys() & {response_type, "DEFAULT_4XX"}:
+        # The built-in ACCESS_DENIED body carries a capitalised `Message` key.
+        template = '{"Message":$context.error.messageString}'
     if template is None:
         template = _DEFAULT_GATEWAY_RESPONSE_TEMPLATE
 
@@ -1477,18 +1471,29 @@ def _gateway_error_response(error, request):
     headers["x-amzn-requestid"] = request["request_id"]
 
     message = error.message
+    message_string = "null" if message is None else json.dumps(message)
+    rendered_type = response_type
+    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR"):
+        # AWS renders the messageString of both types with a leading space, and
+        # $context.error.responseType of an authorizer configuration error as
+        # API_CONFIGURATION_ERROR, while the response entry, its status and
+        # x-amzn-ErrorType stay those of AUTHORIZER_CONFIGURATION_ERROR (measured).
+        message_string = " " + message_string
+        rendered_type = "API_CONFIGURATION_ERROR"
     variables = {
         "context.error.message": "" if message is None else message,
-        "context.error.messageString": "null" if message is None else json.dumps(message),
-        "context.error.responseType": response_type,
+        "context.error.messageString": message_string,
+        "context.error.responseType": rendered_type,
         "context.requestId": request["request_id"],
         "context.resourcePath": request["resource_path"],
         "context.stage": request["stage_name"],
+        # No integration answered, so the status variable renders empty (measured).
+        "context.status": "",
     }
     body = _GATEWAY_TEMPLATE_VARIABLE.sub(
         lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
     )
-    return int(status), headers, body.encode("utf-8")
+    return int(response["statusCode"]), headers, body.encode("utf-8")
 
 
 def _arn_matches(pattern, arn):
@@ -1946,10 +1951,10 @@ async def _authorize_request_v1(
             err_body = result.get("body") or {}
             msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
             # A function that raises exactly "Unauthorized" maps to 401; any other
-            # uncaught error is an authorizer failure → 500.
+            # uncaught error is an authorizer failure → 500 with a null message.
             if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
                 return _gw_error("UNAUTHORIZED", "Unauthorized"), None
-            return _gw_error("AUTHORIZER_FAILURE", "Internal server error"), None
+            return _gw_error("AUTHORIZER_FAILURE", None), None
 
         policy = result.get("body")
         if isinstance(policy, (str, bytes)):
@@ -1963,11 +1968,9 @@ async def _authorize_request_v1(
             return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
 
         principal_id = policy.get("principalId")
-        if principal_id is None or str(principal_id) == "":
-            # AWS demands a principal. Without one the response is an
-            # AUTHORIZER_CONFIGURATION_ERROR, not an Allow that reaches the
-            # backend carrying an empty principalId.
-            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+        has_principal = principal_id is not None and str(principal_id) != ""
+        # AWS evaluates the policy of a TOKEN and of a REQUEST authorizer that
+        # returns no principalId (measured for both); it is not a configuration error.
 
         policy_doc = policy.get("policyDocument")
         if not isinstance(policy_doc, dict):
@@ -1977,7 +1980,8 @@ async def _authorize_request_v1(
             return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
 
         auth_ctx = _stringify_context(policy.get("context"))
-        auth_ctx["principalId"] = str(principal_id)
+        if has_principal:
+            auth_ctx["principalId"] = str(principal_id)
         # Only a well-formed response is cached; failures re-invoke next time.
         cached = (policy_doc, auth_ctx)
         if ttl > 0:
@@ -2024,7 +2028,12 @@ async def _execute_in_scope(
 
     stage = _stages_v1.get(api_id, {}).get(stage_name)
     if not stage:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage_name}' not found"}).encode()
+        # No gateway response applies: the request never reaches a deployment.
+        return (
+            403,
+            {"Content-Type": "application/json", "x-amzn-ErrorType": "ForbiddenException"},
+            b'{"message":"Forbidden"}',
+        )
     request["stage"] = stage
 
     # Match path against resource tree
@@ -2254,7 +2263,7 @@ async def _invoke_lambda_proxy_v1(
     )
     if err:
         # The integration names a function that does not exist.
-        return _gw_error("API_CONFIGURATION_ERROR", err, status=502)
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
     lambda_response, err = _lambda_proxy_response(result)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
@@ -2439,9 +2448,9 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
         return status, resp_headers, resp_body
     except urllib.error.HTTPError as e:
         return e.code, {"Content-Type": "application/json"}, e.read()
-    except Exception as ex:
+    except Exception:
         # An unresolvable or unreachable backend.
-        return _gw_error("API_CONFIGURATION_ERROR", str(ex), status=502)
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
 
 
 def _invoke_mock_v1(integration):

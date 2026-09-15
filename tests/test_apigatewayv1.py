@@ -2497,8 +2497,9 @@ def test_apigwv1_custom_domain_empty_base_path_is_root_mapping(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 
-def test_apigwv1_execute_missing_stage_404(apigw_v1):
-    """execute-api returns 404 when stage does not exist."""
+def test_apigwv1_execute_missing_stage_403(apigw_v1):
+    """execute-api answers an unknown stage with 403 Forbidden, outside the
+    gateway responses."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -2507,14 +2508,16 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
     apigw_v1.put_method(restApiId=api_id, resourceId=root_id, httpMethod="GET", authorizationType="NONE")
     apigw_v1.put_integration(restApiId=api_id, resourceId=root_id, httpMethod="GET", type="MOCK")
     apigw_v1.create_deployment(restApiId=api_id)
-    # Do NOT create a stage — request to a nonexistent stage should 404
+    # Do NOT create a stage — request to a nonexistent stage should 403
 
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/nonexistent/"
     req = _urlreq.Request(url, method="GET")
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     with pytest.raises(_urlerr.HTTPError) as exc:
         _urlreq.urlopen(req)
-    assert exc.value.code == 404
+    assert exc.value.code == 403
+    assert exc.value.headers["x-amzn-ErrorType"] == "ForbiddenException"
+    assert exc.value.read() == b'{"message":"Forbidden"}'
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 def test_apigwv1_execute_missing_method_403(apigw_v1):
@@ -3827,40 +3830,6 @@ def test_apigwv1_authorizer_invalid_validation_expression_is_500(apigw_v1, lam):
         _auth_drop_lambda(lam, authz)
 
 
-def test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached(apigw_v1, lam, sqs):
-    """AWS requires a principal. An Allow policy with no principalId is an
-    AUTHORIZER_CONFIGURATION_ERROR, not an allow that reaches the backend with
-    an empty principalId — and a configuration error is never cached."""
-    qname = _auth_counter_queue(sqs)
-    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
-    authz = _auth_make_lambda(
-        lam, "noprincipal",
-        _AUTH_MARK_PRELUDE
-        + "def handler(event, context):\n"
-        f"    _mark({qname!r})\n"
-        "    return {'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
-        "        {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
-        "         'Resource': event['methodArn']}]}}\n",
-    )
-    api_id, _ = _auth_build_api(
-        apigw_v1, backend,
-        dict(name="noprincipal", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
-             authorizerResultTtlInSeconds=300),
-    )
-    try:
-        url = _auth_execute_url(api_id, "test", "secure")
-        for _ in range(2):
-            status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
-            assert status == 500
-            assert json.loads(body) == {"message": "Internal server error"}
-        assert _auth_count(sqs, qname) == 2, "a configuration error must not be cached"
-    finally:
-        _auth_drop_api(apigw_v1, api_id)
-        _auth_drop_lambda(lam, backend)
-        _auth_drop_lambda(lam, authz)
-        _auth_delete_queue(sqs, qname)
-
-
 def test_apigwv1_authorizer_without_policy_document_is_500_and_not_cached(apigw_v1, lam, sqs):
     """A response with no policyDocument is a misconfigured authorizer: AWS
     answers 500 AuthorizerConfigurationException, not an implicit deny — and
@@ -4507,15 +4476,19 @@ def test_apigwv1_cognito_authorization_scopes(apigw_v1, lam, cognito_idp):
 
 _GWRESP_AUTHORIZER = (
     "def handler(event, context):\n"
-    "    token = event.get('authorizationToken', '')\n"
+    "    headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+    "    token = event.get('authorizationToken') or headers.get('authorization', '')\n"
     "    if token == 'unauth':\n"
     "        raise Exception('Unauthorized')\n"
     "    if token == 'crash':\n"
     "        raise ValueError('boom')\n"
     "    effect = 'Deny' if token == 'deny' else 'Allow'\n"
-    "    return {'principalId': 'u1', 'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+    "    policy = {'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
     "        {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
     "         'Resource': event['methodArn'].split('/')[0] + '/*'}]}}\n"
+    "    if token != 'noprincipal':\n"
+    "        policy['principalId'] = 'u1'\n"
+    "    return policy\n"
 )
 _GWRESP_MISSING_FN = "v1-gwresp-does-not-exist"
 
@@ -4546,9 +4519,22 @@ def gwresp_api(apigw_v1, lam):
         )
         return rid
 
+    request_authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="req", type="REQUEST", authorizerUri=_auth_lambda_uri(authz),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+    missing_authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="missing", type="TOKEN", authorizerUri=_auth_lambda_uri(_GWRESP_MISSING_FN),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+
     mock("mock")
     auth_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="auth")["id"]
     mock("{x}", parent=auth_id, authorizationType="CUSTOM", authorizerId=authorizer_id)
+    req_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="req")["id"]
+    mock("{x}", parent=req_id, authorizationType="CUSTOM", authorizerId=request_authorizer_id)
+    missing_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="authmissing")["id"]
+    mock("{x}", parent=missing_id, authorizationType="CUSTOM", authorizerId=missing_authorizer_id)
     mock("iam", authorizationType="AWS_IAM")
     rid = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="nolambda")["id"]
     apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", authorizationType="NONE")
@@ -4587,8 +4573,7 @@ def _gwresp_call(api_id, path, headers=None, stage="s1"):
     return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
 
 
-_GWRESP_DENY = "User is not authorized to access this resource with an explicit deny"
-_GWRESP_NOLAMBDA = f"Lambda function 'arn:aws:lambda:us-east-1:000000000000:function:{_GWRESP_MISSING_FN}' not found"
+_GWRESP_DENY = "User is not authorized to access this resource with an explicit deny in an identity-based policy"
 
 
 @pytest.mark.parametrize(
@@ -4605,10 +4590,18 @@ _GWRESP_NOLAMBDA = f"Lambda function 'arn:aws:lambda:us-east-1:000000000000:func
         ("auth/abc", {"Authorization": "deny"}, 403, "ACCESS_DENIED", "AccessDeniedException",
          b'{"Message":"%s"}' % _GWRESP_DENY.encode()),
         ("auth/abc", {"Authorization": "crash"}, 500, "AUTHORIZER_FAILURE", "AuthorizerConfigurationException",
-         b'{"message":"Internal server error"}'),
+         b'{"message":null}'),
         ("auth/abc", {"Authorization": "allow"}, 200, None, None, b'{"ok":true}'),
-        ("nolambda", {}, 502, "API_CONFIGURATION_ERROR", "InternalServerErrorException",
-         b'{"message":"%s"}' % _GWRESP_NOLAMBDA.encode()),
+        # An authorizer returning no principalId still has its policy evaluated, TOKEN and REQUEST alike.
+        ("auth/abc", {"Authorization": "noprincipal"}, 200, None, None, b'{"ok":true}'),
+        ("req/abc", {"Authorization": "noprincipal"}, 200, None, None, b'{"ok":true}'),
+        ("req/abc", {"Authorization": "allow"}, 200, None, None, b'{"ok":true}'),
+        # An authorizer naming a missing function; AWS renders its messageString with a leading space too.
+        ("authmissing/abc", {"Authorization": "x"}, 500, "AUTHORIZER_CONFIGURATION_ERROR",
+         "AuthorizerConfigurationException", b'{"message": "Internal server error"}'),
+        # AWS renders this type's messageString with a leading space.
+        ("nolambda", {}, 500, "API_CONFIGURATION_ERROR", "InternalServerErrorException",
+         b'{"message": "Internal server error"}'),
     ],
 )
 def test_apigwv1_gateway_response_types(
@@ -4660,7 +4653,7 @@ _GWRESP_D5 = {
         ("auth/abc", {"Authorization": "deny"}, {"DEFAULT_4XX": _GWRESP_D4}, 403, "d4",
          {"d4": _GWRESP_DENY, "type": "ACCESS_DENIED"}),
         ("auth/abc", {"Authorization": "crash"}, {"DEFAULT_4XX": _GWRESP_D4, "DEFAULT_5XX": _GWRESP_D5}, 500, "d5",
-         {"d5": "Internal server error", "type": "AUTHORIZER_FAILURE"}),
+         {"d5": None, "type": "AUTHORIZER_FAILURE"}),
     ],
 )
 def test_apigwv1_gateway_response_precedence(
@@ -4709,6 +4702,23 @@ def test_apigwv1_gateway_response_mappings(apigw_v1, gwresp_api, path, headers, 
     assert got_headers["x-req"] == request_id
     assert json.loads(body) == {"msg": "Unauthorized", "type": "UNAUTHORIZED", "raw": "Unauthorized",
                     "rid": request_id, "rpath": "/auth/{x}", "stage": "s1"}
+
+
+def test_apigwv1_gateway_response_configuration_error_variables(apigw_v1, gwresp_api):
+    """$context.error.responseType of an authorizer configuration error renders as
+    API_CONFIGURATION_ERROR while the entry, status and x-amzn-ErrorType stay the
+    authorizer's; $context.status renders empty (both measured)."""
+    template = '{"t":"$context.error.responseType","m":$context.error.messageString,"s":"$context.status"}'
+    _gwresp_deploy(apigw_v1, gwresp_api, {
+        "AUTHORIZER_CONFIGURATION_ERROR": {"statusCode": "503", "responseTemplates": {"application/json": template}},
+        "DEFAULT_5XX": {"responseTemplates": {"application/json": template}},
+    })
+    status, headers, body = _gwresp_call(gwresp_api, "authmissing/abc", {"Authorization": "x"})
+    assert (status, headers.get("x-amzn-errortype")) == (503, "AuthorizerConfigurationException")
+    assert body == b'{"t":"API_CONFIGURATION_ERROR","m": "Internal server error","s":""}'
+    status, headers, body = _gwresp_call(gwresp_api, "nolambda")
+    assert (status, headers.get("x-amzn-errortype")) == (500, "InternalServerErrorException")
+    assert body == b'{"t":"API_CONFIGURATION_ERROR","m": "Internal server error","s":""}'
 
 
 def test_apigwv1_gateway_responses_take_effect_on_deployment(apigw_v1, gwresp_api):
