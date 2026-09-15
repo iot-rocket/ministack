@@ -220,6 +220,8 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
                 "responseTemplates": {"application/json": '{"persisted":true}'},
             },
         )
+        _status, _headers, body = service._create_deployment(api_id, {})
+        deployment_id = json.loads(body)["id"]
 
         snapshot = service.get_state()
         service.reset()
@@ -228,6 +230,7 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
         restored = service._gateway_responses[api_id]["BAD_REQUEST_BODY"]
         assert restored["statusCode"] == "422"
         assert restored["responseTemplates"] == {"application/json": '{"persisted":true}'}
+        assert service._deployed_gateway_responses[api_id][deployment_id] == {"BAD_REQUEST_BODY": restored}
     finally:
         service.reset()
 
@@ -4491,9 +4494,265 @@ def test_apigwv1_cognito_authorization_scopes(apigw_v1, lam, cognito_idp):
         assert _call(_v1_signed_token({**base, "scope": "files/read files/write"})) == 200
         # A token whose scopes do not overlap is authenticated but not authorized.
         assert _call(_v1_signed_token({**base, "scope": "other/scope"})) == 403
+        assert _auth_http(url, headers={"Host": host, "Authorization": _v1_signed_token({**base, "scope": "other/scope"})})[1] == b'{"message": "Forbidden"}'
         # An ID token carries no scopes at all, so it can never satisfy one.
         assert _call(_v1_signed_token({**base, "token_use": "id", "aud": "c1"})) == 403
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+# ---- Data plane: gateway responses ----
+
+_GWRESP_AUTHORIZER = (
+    "def handler(event, context):\n"
+    "    token = event.get('authorizationToken', '')\n"
+    "    if token == 'unauth':\n"
+    "        raise Exception('Unauthorized')\n"
+    "    if token == 'crash':\n"
+    "        raise ValueError('boom')\n"
+    "    effect = 'Deny' if token == 'deny' else 'Allow'\n"
+    "    return {'principalId': 'u1', 'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+    "        {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
+    "         'Resource': event['methodArn'].split('/')[0] + '/*'}]}}\n"
+)
+_GWRESP_MISSING_FN = "v1-gwresp-does-not-exist"
+
+
+@pytest.fixture(scope="module")
+def gwresp_api(apigw_v1, lam):
+    """A deployed API (stage s1, variable sv) serving MOCK /mock, TOKEN-guarded
+    /auth/{x}, AWS_IAM /iam and an AWS_PROXY /nolambda naming a missing function."""
+    authz = _auth_make_lambda(lam, "gwresp", _GWRESP_AUTHORIZER)
+    api_id = apigw_v1.create_rest_api(name=f"v1-gwresp-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    root_id = _auth_root_id(apigw_v1, api_id)
+    authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+
+    def mock(path_part, parent=root_id, **method_kwargs):
+        rid = apigw_v1.create_resource(restApiId=api_id, parentId=parent, pathPart=path_part)["id"]
+        method_kwargs.setdefault("authorizationType", "NONE")
+        apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", **method_kwargs)
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", type="MOCK",
+            requestTemplates={"application/json": '{"statusCode": 200}'},
+        )
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", statusCode="200",
+            responseTemplates={"application/json": '{"ok":true}'},
+        )
+        return rid
+
+    mock("mock")
+    auth_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="auth")["id"]
+    mock("{x}", parent=auth_id, authorizationType="CUSTOM", authorizerId=authorizer_id)
+    mock("iam", authorizationType="AWS_IAM")
+    rid = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="nolambda")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", authorizationType="NONE")
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=rid, httpMethod="GET", type="AWS_PROXY",
+        integrationHttpMethod="POST", uri=_auth_lambda_uri(_GWRESP_MISSING_FN),
+    )
+    apigw_v1.create_deployment(restApiId=api_id, stageName="s1", variables={"sv": "stagevar-v"})
+    try:
+        yield api_id
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, authz)
+
+
+def _gwresp_deploy(apigw_v1, api_id, responses):
+    """Replace the API's customized gateway responses and redeploy stage s1."""
+    for item in apigw_v1.get_gateway_responses(restApiId=api_id)["items"]:
+        if not item["defaultResponse"]:
+            apigw_v1.delete_gateway_response(restApiId=api_id, responseType=item["responseType"])
+    for response_type, kwargs in responses.items():
+        apigw_v1.put_gateway_response(restApiId=api_id, responseType=response_type, **kwargs)
+    apigw_v1.create_deployment(restApiId=api_id, stageName="s1")
+
+
+def _gwresp_call(api_id, path, headers=None, stage="s1"):
+    """(status, lower-cased headers, raw body) without raising on errors."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(_auth_execute_url(api_id, stage, path), headers=headers or {})
+    try:
+        resp = _urlreq.urlopen(req, timeout=30)
+    except _urlerr.HTTPError as e:
+        resp = e
+    return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+
+
+_GWRESP_DENY = "User is not authorized to access this resource with an explicit deny"
+_GWRESP_NOLAMBDA = f"Lambda function 'arn:aws:lambda:us-east-1:000000000000:function:{_GWRESP_MISSING_FN}' not found"
+
+
+@pytest.mark.parametrize(
+    "path,headers,status,response_type,error_type,builtin_body",
+    [
+        ("mock", {}, 200, None, None, b'{"ok":true}'),
+        ("nope", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
+         b'{"message":"Missing Authentication Token"}'),
+        ("iam", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
+         b'{"message":"Missing Authentication Token"}'),
+        ("auth/abc", {}, 401, "UNAUTHORIZED", "UnauthorizedException", b'{"message":"Unauthorized"}'),
+        ("auth/abc", {"Authorization": "unauth"}, 401, "UNAUTHORIZED", "UnauthorizedException",
+         b'{"message":"Unauthorized"}'),
+        ("auth/abc", {"Authorization": "deny"}, 403, "ACCESS_DENIED", "AccessDeniedException",
+         b'{"Message":"%s"}' % _GWRESP_DENY.encode()),
+        ("auth/abc", {"Authorization": "crash"}, 500, "AUTHORIZER_FAILURE", "AuthorizerConfigurationException",
+         b'{"message":"Internal server error"}'),
+        ("auth/abc", {"Authorization": "allow"}, 200, None, None, b'{"ok":true}'),
+        ("nolambda", {}, 502, "API_CONFIGURATION_ERROR", "InternalServerErrorException",
+         b'{"message":"%s"}' % _GWRESP_NOLAMBDA.encode()),
+    ],
+)
+def test_apigwv1_gateway_response_types(
+    apigw_v1, gwresp_api, path, headers, status, response_type, error_type, builtin_body
+):
+    """Each gateway error resolves to its response type: built-in body without
+    customization, the type's own customized response once every type is
+    tagged. Integration responses never carry x-amzn-ErrorType."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {})
+    got_status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert (got_status, got_headers.get("x-amzn-errortype"), body) == (status, error_type, builtin_body)
+
+    tagged = {t: {"responseParameters": {"gatewayresponse.header.X-Gw-Type": f"'{t}'"}}
+              for t in apigateway_v1._DEFAULT_GATEWAY_RESPONSE_STATUS_CODES}
+    tagged["DEFAULT_4XX"] = {"responseParameters": {"gatewayresponse.header.X-Default": "'4'"}}
+    tagged["DEFAULT_5XX"] = {"responseParameters": {"gatewayresponse.header.X-Default": "'5'"}}
+    _gwresp_deploy(apigw_v1, gwresp_api, tagged)
+    got_status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert got_headers.get("x-gw-type") == response_type
+    assert "x-default" not in got_headers
+    assert got_headers.get("x-amzn-errortype") == error_type
+    if response_type:
+        # A customized response keeps the type's default status and template.
+        assert got_status == int(apigateway_v1._DEFAULT_GATEWAY_RESPONSE_STATUS_CODES[response_type])
+        assert json.loads(body) == {"message": next(iter(json.loads(builtin_body).values()))}
+
+
+_GWRESP_D4 = {
+    "responseParameters": {"gatewayresponse.header.X-Default": "'d4'"},
+    "responseTemplates": {"application/json": '{"d4":$context.error.messageString,"type":"$context.error.responseType"}'},
+}
+_GWRESP_D5 = {
+    "responseParameters": {"gatewayresponse.header.X-Default": "'d5'"},
+    "responseTemplates": {"application/json": '{"d5":$context.error.messageString,"type":"$context.error.responseType"}'},
+}
+
+
+@pytest.mark.parametrize(
+    "path,headers,responses,status,x_default,body",
+    [
+        # A specific response replaces DEFAULT_4XX (no header merge) and may override the status.
+        ("nope", {}, {"DEFAULT_4XX": _GWRESP_D4, "MISSING_AUTHENTICATION_TOKEN": {
+            "statusCode": "404", "responseParameters": {"gatewayresponse.header.X-Mat": "'mat'"},
+            "responseTemplates": {"application/json": '{"notfound":$context.error.messageString}'}}},
+         404, None, {"notfound": "Missing Authentication Token"}),
+        ("nope", {}, {"DEFAULT_4XX": _GWRESP_D4}, 403, "d4",
+         {"d4": "Missing Authentication Token", "type": "MISSING_AUTHENTICATION_TOKEN"}),
+        ("nope", {}, {"DEFAULT_5XX": _GWRESP_D5}, 403, None, {"message": "Missing Authentication Token"}),
+        ("auth/abc", {"Authorization": "deny"}, {"DEFAULT_4XX": _GWRESP_D4}, 403, "d4",
+         {"d4": _GWRESP_DENY, "type": "ACCESS_DENIED"}),
+        ("auth/abc", {"Authorization": "crash"}, {"DEFAULT_4XX": _GWRESP_D4, "DEFAULT_5XX": _GWRESP_D5}, 500, "d5",
+         {"d5": "Internal server error", "type": "AUTHORIZER_FAILURE"}),
+    ],
+)
+def test_apigwv1_gateway_response_precedence(
+    apigw_v1, gwresp_api, path, headers, responses, status, x_default, body
+):
+    _gwresp_deploy(apigw_v1, gwresp_api, responses)
+    got_status, got_headers, got_body = _gwresp_call(gwresp_api, path, headers)
+    assert (got_status, got_headers.get("x-default"), json.loads(got_body)) == (status, x_default, body)
+    assert ("x-mat" in got_headers) == ("MISSING_AUTHENTICATION_TOKEN" in responses)
+
+
+@pytest.mark.parametrize(
+    "path,headers,expected",
+    [
+        ("auth/abc?q=qv", {"Origin": "https://probe.example", "Accept": "application/xml"},
+         {"x-origin": "https://probe.example", "x-query": "qv"}),
+        # A missing source omits the header; an empty one keeps it empty.
+        ("auth/abc", {"Origin": ""}, {"x-origin": "", "x-query": None}),
+        ("auth/abc", {}, {"x-origin": None, "x-query": None}),
+    ],
+)
+def test_apigwv1_gateway_response_mappings(apigw_v1, gwresp_api, path, headers, expected):
+    _gwresp_deploy(apigw_v1, gwresp_api, {"UNAUTHORIZED": {
+        "statusCode": "418",
+        "responseParameters": {
+            "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+            "gatewayresponse.header.X-Origin": "method.request.header.origin",
+            "gatewayresponse.header.X-Path": "method.request.path.x",
+            "gatewayresponse.header.X-Query": "method.request.querystring.q",
+            "gatewayresponse.header.X-Stagevar": "stageVariables.sv",
+            "gatewayresponse.header.X-Req": "context.requestId",
+        },
+        "responseTemplates": {"application/json": (
+            '{"msg":$context.error.messageString,"type":"$context.error.responseType",'
+            '"raw":"$context.error.message","rid":"$context.requestId",'
+            '"rpath":"$context.resourcePath","stage":"$context.stage"}'
+        )},
+    }})
+    status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert status == 418
+    assert got_headers["content-type"] == "application/json"
+    assert got_headers["access-control-allow-origin"] == "*"
+    assert (got_headers["x-path"], got_headers["x-stagevar"]) == ("abc", "stagevar-v")
+    assert {k: got_headers.get(k) for k in expected} == expected
+    request_id = got_headers["x-amzn-requestid"]
+    assert got_headers["x-req"] == request_id
+    assert json.loads(body) == {"msg": "Unauthorized", "type": "UNAUTHORIZED", "raw": "Unauthorized",
+                    "rid": request_id, "rpath": "/auth/{x}", "stage": "s1"}
+
+
+def test_apigwv1_gateway_responses_take_effect_on_deployment(apigw_v1, gwresp_api):
+    """The data plane answers with the responses of the stage's last deployment."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {})
+
+    def marker():
+        return _gwresp_call(gwresp_api, "nope")[1].get("x-mark")
+
+    apigw_v1.put_gateway_response(
+        restApiId=gwresp_api, responseType="MISSING_AUTHENTICATION_TOKEN",
+        responseParameters={"gatewayresponse.header.X-Mark": "'v1'"},
+    )
+    assert marker() is None
+    apigw_v1.create_deployment(restApiId=gwresp_api, stageName="s1")
+    assert marker() == "v1"
+    apigw_v1.delete_gateway_response(restApiId=gwresp_api, responseType="MISSING_AUTHENTICATION_TOKEN")
+    assert marker() == "v1"
+    apigw_v1.create_deployment(restApiId=gwresp_api, stageName="s1")
+    assert marker() is None
+
+
+def test_apigwv1_gateway_response_defaults_on_the_control_plane(apigw_v1, gwresp_api):
+    """PutGatewayResponse without templates stores the default template; an
+    uncustomized type reports the DEFAULT_4XX / DEFAULT_5XX it inherits."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {"DEFAULT_4XX": _GWRESP_D4})
+    put = apigw_v1.put_gateway_response(
+        restApiId=gwresp_api, responseType="ACCESS_DENIED",
+        responseParameters={"gatewayresponse.header.X-A": "'a'"},
+    )
+    assert put["responseTemplates"] == {"application/json": '{"message":$context.error.messageString}'}
+
+    expected_unauthorized = {
+        "responseType": "UNAUTHORIZED", "statusCode": "401", "defaultResponse": True,
+        "responseParameters": _GWRESP_D4["responseParameters"],
+        "responseTemplates": _GWRESP_D4["responseTemplates"],
+    }
+    got = apigw_v1.get_gateway_response(restApiId=gwresp_api, responseType="UNAUTHORIZED")
+    got.pop("ResponseMetadata")
+    assert got == expected_unauthorized
+    items = {i["responseType"]: i for i in apigw_v1.get_gateway_responses(restApiId=gwresp_api)["items"]}
+    assert items["UNAUTHORIZED"] == expected_unauthorized
+    assert items["API_CONFIGURATION_ERROR"]["responseParameters"] == {}
+
+    apigw_v1.delete_gateway_response(restApiId=gwresp_api, responseType="DEFAULT_4XX")
+    got = apigw_v1.get_gateway_response(restApiId=gwresp_api, responseType="UNAUTHORIZED")
+    assert (got["defaultResponse"], got["responseParameters"]) == (True, {})
