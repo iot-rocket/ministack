@@ -1132,6 +1132,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_cfn_capabilities_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
 
 
@@ -1212,6 +1216,23 @@ def _handle_transfer_sftp_ports_request(method: str, path: str):
             "per_server": dict(transfer._sftp_per_server_ports),
         }
     except Exception as e:
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+    return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
+
+
+def _handle_cfn_capabilities_request(method: str, path: str):
+    """Serve the registry inventory and declared CloudFormation feature limits.
+
+    Keep the import behind the path check so unrelated requests stay lazy.
+    """
+    if path != "/_ministack/cfn/capabilities" or method != "GET":
+        return None
+    try:
+        from ministack.services.cloudformation import capabilities
+
+        body = capabilities.cached()
+    except Exception as e:
+        logger.exception("Error building the CloudFormation capabilities document: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
     return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
 

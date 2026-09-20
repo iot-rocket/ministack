@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — capabilities endpoint and generated resource table** — `GET /_ministack/cfn/capabilities` exposes the registry inventory and declared feature limits. `scripts/cfn_capabilities.py --readme` generates the README resource table and preserves its Ref descriptions. Contributed by @iot-rocket.
+
 ### Fixed
 
 - **RDS — PostgreSQL TLS with long endpoint names** — use a short certificate common name while retaining complete DNS and IP subject alternative names, so endpoints longer than 64 bytes no longer fail certificate generation.
