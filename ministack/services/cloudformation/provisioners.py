@@ -7274,14 +7274,24 @@ def _ec2_sg_create(logical_id, props, stack_name):
         "Description": desc,
         "VpcId": vpc_id,
         "OwnerId": get_account_id(),
-        "IpPermissions": [],
-        "IpPermissionsEgress": [
-            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-             "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
-        ],
+        "IpPermissions": _ec2_sg_permissions(props.get("SecurityGroupIngress")),
+        "IpPermissionsEgress": _ec2_sg_egress_permissions(props.get("SecurityGroupEgress")),
     }
-    # Apply ingress rules from props
-    for rule in props.get("SecurityGroupIngress", []):
+    _ec2_apply_tags(sg_id, props)
+    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group/{sg_id}"
+    return sg_id, {"GroupId": sg_id, "VpcId": vpc_id, "Arn": arn}
+
+
+def _ec2_sg_permissions(rules):
+    """A template's ingress or egress rules in the shape the EC2 store keeps
+    and DescribeSecurityGroups renders, each source with the rule's
+    Description. A prefix-list source (SourcePrefixListId, and
+    DestinationPrefixListId on egress) and a source group's name and owner are
+    rule members too; dropping them lost a prefix-list rule outright."""
+    permissions = []
+    for rule in (rules or []):
+        if not isinstance(rule, dict):
+            continue
         perm = {
             "IpProtocol": rule.get("IpProtocol", "tcp"),
             "IpRanges": [],
@@ -7293,16 +7303,111 @@ def _ec2_sg_create(logical_id, props, stack_name):
             perm["FromPort"] = int(rule["FromPort"])
         if "ToPort" in rule:
             perm["ToPort"] = int(rule["ToPort"])
+        described = {"Description": rule["Description"]} if rule.get("Description") else {}
         if "CidrIp" in rule:
-            perm["IpRanges"].append({"CidrIp": rule["CidrIp"]})
-        _ec2._security_groups[sg_id]["IpPermissions"].append(perm)
+            perm["IpRanges"].append({"CidrIp": rule["CidrIp"], **described})
+        if "CidrIpv6" in rule:
+            perm["Ipv6Ranges"].append({"CidrIpv6": rule["CidrIpv6"], **described})
+        prefix_list = rule.get("SourcePrefixListId") or rule.get("DestinationPrefixListId")
+        if prefix_list:
+            perm["PrefixListIds"].append({"PrefixListId": prefix_list, **described})
+        group_id = rule.get("SourceSecurityGroupId") or rule.get("DestinationSecurityGroupId")
+        group_name = rule.get("SourceSecurityGroupName")
+        if group_id or group_name:
+            pair = {"GroupId": group_id} if group_id else {"GroupName": group_name}
+            if group_id and group_name:
+                pair["GroupName"] = group_name
+            if rule.get("SourceSecurityGroupOwnerId"):
+                pair["UserId"] = str(rule["SourceSecurityGroupOwnerId"])
+            perm["UserIdGroupPairs"].append({**pair, **described})
+        permissions.append(perm)
+    return permissions
 
-    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group/{sg_id}"
-    return sg_id, {"GroupId": sg_id, "VpcId": vpc_id, "Arn": arn}
+
+def _ec2_sg_egress_permissions(rules):
+    """The egress a create gives a group from its SecurityGroupEgress: the
+    template's own rules, or the allow-all rule AWS adds when it declares
+    none (the create used to hard-code allow-all and drop the template's
+    egress entirely)."""
+    return _ec2_sg_permissions(rules) or [
+        {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+         "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
+    ]
+
+
+def _ec2_sg_permission_key(perm):
+    """A permission reduced to what identifies it, its protocol, ports and
+    sources, so the same rule declared twice compares equal whatever its
+    description."""
+    return (
+        perm.get("IpProtocol"),
+        perm.get("FromPort"),
+        perm.get("ToPort"),
+        tuple(sorted(r.get("CidrIp", "") for r in perm.get("IpRanges", []))),
+        tuple(sorted(r.get("CidrIpv6", "") for r in perm.get("Ipv6Ranges", []))),
+        tuple(sorted(r.get("PrefixListId", "") for r in perm.get("PrefixListIds", []))),
+        tuple(sorted((p.get("GroupId", ""), p.get("GroupName", ""), p.get("UserId", ""))
+                     for p in perm.get("UserIdGroupPairs", []))),
+    )
+
+
+def _ec2_sg_reconcile(store, old_perms, new_perms):
+    """Apply a rule-property change the way the tag reconcilers apply a tag
+    change: rules the template dropped are revoked, the new ones authorized,
+    a rule whose description changed is replaced by its new form, and a rule
+    added through AuthorizeSecurityGroupIngress/Egress outside the template is
+    left alone, as it is on AWS. Both sides are what the create would write
+    for that template, so the allow-all egress rule comes and goes with the
+    template's own egress rules."""
+    if old_perms == new_perms:
+        return
+    keys = ({_ec2_sg_permission_key(p) for p in old_perms}
+            | {_ec2_sg_permission_key(p) for p in new_perms})
+    store[:] = [p for p in store if _ec2_sg_permission_key(p) not in keys] + new_perms
+
+
+def _ec2_sg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a security group in place. SecurityGroupIngress and
+    SecurityGroupEgress are "Some interruptions" on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-securitygroup.html),
+    which is an in-place update, and Tags is No interruption; GroupDescription,
+    GroupName and VpcId are Replacement and are read as one key.
+
+    The create mints a new sg- id, so the fallback replaced the group and took
+    every rule authorized outside the template with it, while each instance
+    still held the old group id."""
+    _ec2._ensure_defaults_initialized()
+    group = _ec2._security_groups.get(physical_id)
+    name = new_props.get("GroupName", f"{stack_name}-{logical_id or physical_id}")
+    key = (name,
+           new_props.get("GroupDescription", name),
+           new_props.get("VpcId", _ec2._DEFAULT_VPC_ID))
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        key,
+        (group["GroupName"], group["Description"], group["VpcId"]) if group else None,
+        _ec2_sg_create, _ec2_sg_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _ec2_sg_reconcile(group.setdefault("IpPermissions", []),
+                      _ec2_sg_permissions(old_props.get("SecurityGroupIngress")),
+                      _ec2_sg_permissions(new_props.get("SecurityGroupIngress")))
+    if old_props.get("SecurityGroupEgress") != new_props.get("SecurityGroupEgress"):
+        # Declaring egress takes the create's allow-all rule away. Dropping the
+        # declaration again does not bring it back: measured on AWS, the group
+        # is left with no egress rule from the template.
+        _ec2_sg_reconcile(group.setdefault("IpPermissionsEgress", []),
+                          _ec2_sg_egress_permissions(old_props.get("SecurityGroupEgress")),
+                          _ec2_sg_permissions(new_props.get("SecurityGroupEgress")))
+    _ec2_apply_tags(physical_id, new_props, old_props)
+    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group/{physical_id}"
+    return physical_id, {"GroupId": physical_id, "VpcId": group["VpcId"], "Arn": arn}
 
 
 def _ec2_sg_delete(physical_id, props):
     _ec2._security_groups.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 def _ec2_igw_create(logical_id, props, stack_name):
@@ -11539,7 +11644,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ec2_subnet_delete,
     },
-    "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
+    "AWS::EC2::SecurityGroup": {
+        "create": _ec2_sg_create,
+        "update": _ec2_sg_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_sg_delete,
+    },
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},

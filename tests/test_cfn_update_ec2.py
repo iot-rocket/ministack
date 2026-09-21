@@ -519,6 +519,176 @@ def test_cfn_ec2_security_group_update_keeps_id_and_rules(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ec2_security_group_rule_members_update_in_place(cfn, ec2):
+    """A rule's Description, a SourcePrefixListId source and a source group's
+    name and owner are members of SecurityGroupIngress and
+    SecurityGroupEgress. AWS applies a rule with a prefix-list source and
+    changes a description in place (measured 2026-09-21); the provisioner
+    dropped all of them, so a prefix-list rule was lost outright and two
+    rules differing only in their prefix list compared equal."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sg-members-{suffix}"
+    prefix_list = ec2.create_managed_prefix_list(
+        PrefixListName=f"cfn-sg-members-{suffix}", MaxEntries=1, AddressFamily="IPv4",
+        Entries=[{"Cidr": "198.51.100.0/24"}])["PrefixList"]["PrefixListId"]
+
+    def template(ingress_description, egress_description, with_list):
+        ingress = [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                    "CidrIp": "10.0.0.0/8", "Description": ingress_description},
+                   {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080,
+                    "SourceSecurityGroupId": {"Fn::GetAtt": ["Vpc", "DefaultSecurityGroup"]},
+                    "Description": "from the default group"}]
+        if with_list:
+            ingress.append({"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                            "SourcePrefixListId": prefix_list, "Description": "from the list"})
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.57.0.0/16"}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                    "GroupDescription": "members", "VpcId": {"Ref": "Vpc"},
+                    "SecurityGroupIngress": ingress,
+                    "SecurityGroupEgress": [{"IpProtocol": "-1", "CidrIp": "0.0.0.0/0",
+                                             "Description": egress_description}]}},
+            },
+            "Outputs": {"Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}},
+        })
+
+    def rules(group_id, member):
+        group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+        flat = []
+        for perm in group[member]:
+            for entry in perm.get("IpRanges", []):
+                flat.append((perm.get("FromPort"), entry["CidrIp"], entry.get("Description")))
+            for entry in perm.get("PrefixListIds", []):
+                flat.append((perm.get("FromPort"), entry["PrefixListId"], entry.get("Description")))
+            for entry in perm.get("UserIdGroupPairs", []):
+                flat.append((perm.get("FromPort"), "group", entry.get("Description")))
+        return sorted(flat, key=str)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("a", "e1", True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group_id = _cfn_output(cfn, stack_name, "Sg")
+        listed = (443, prefix_list, "from the list")
+        by_group = (8080, "group", "from the default group")
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "a"), listed, by_group], key=str)
+        assert rules(group_id, "IpPermissionsEgress") == [(None, "0.0.0.0/0", "e1")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e1", True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Sg") == group_id
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "b"), listed, by_group], key=str)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e2", True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert rules(group_id, "IpPermissionsEgress") == [(None, "0.0.0.0/0", "e2")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e2", False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "b"), by_group], key=str)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ec2.delete_managed_prefix_list(PrefixListId=prefix_list)
+
+
+def test_cfn_ec2_security_group_egress_update_matches_the_create(cfn, ec2):
+    """A group whose template declares no egress gets the allow-all egress
+    rule, and one that declares egress gets only those rules. Measured on AWS
+    2026-09-21: declaring egress in an update takes the allow-all rule away,
+    and dropping the declaration again leaves the group with no egress rule
+    from the template; allow-all does not come back. A rule authorized
+    outside the template stays either way."""
+    stack_name = f"cfn-sg-egress-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(egress):
+        props = {"GroupDescription": "egress", "VpcId": {"Ref": "Vpc"}}
+        if egress:
+            props["SecurityGroupEgress"] = [
+                {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                 "CidrIp": "10.0.0.0/8"}]
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.58.0.0/16"}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": props},
+            },
+            "Outputs": {"Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}},
+        })
+
+    def egress(group_id):
+        group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+        return sorted(
+            (perm["IpProtocol"], perm.get("FromPort"), entry["CidrIp"])
+            for perm in group["IpPermissionsEgress"]
+            for entry in perm.get("IpRanges", [])
+        )
+
+    allow_all = ("-1", None, "0.0.0.0/0")
+    declared = ("tcp", 443, "10.0.0.0/8")
+    foreign = ("tcp", 25, "192.0.2.0/24")
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        group_id = _cfn_output(cfn, stack_name, "Sg")
+        ec2.authorize_security_group_egress(
+            GroupId=group_id,
+            IpPermissions=[{"IpProtocol": "tcp", "FromPort": 25, "ToPort": 25,
+                            "IpRanges": [{"CidrIp": "192.0.2.0/24"}]}])
+        assert egress(group_id) == sorted([allow_all, foreign])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert egress(group_id) == sorted([declared, foreign]), (
+            "declaring egress kept the allow-all rule the create would not add")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert egress(group_id) == sorted([foreign]), (
+            "dropping the egress declaration brought the allow-all rule back")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_security_group_ingress_change_is_rolled_back(cfn, ec2):
+    """An ingress rule change is applied in place, so a later failure in the
+    same update has to take the new rule away again. Measured on AWS
+    2026-09-21: the group's ingress ports read [22] again after
+    UPDATE_ROLLBACK_COMPLETE, under the same group id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sg-rb-{suffix}"
+
+    def template(ports, with_bad):
+        resources = {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.50.0.0/16"}},
+            "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "probe", "VpcId": {"Ref": "Vpc"},
+                "SecurityGroupIngress": [
+                    {"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
+                     "CidrIp": "10.0.0.0/8"} for port in ports]}},
+        }
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "Sg"}
+        return json.dumps({"Resources": resources,
+                           "Outputs": {"SgId": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template([22], False))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        sg_id = _cfn_output(cfn, stack_name, "SgId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template([22, 443], True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "SgId") == sg_id
+        perms = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]
+        assert sorted(p["FromPort"] for p in perms if "FromPort" in p) == [22]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_launch_template_update_adds_a_version(cfn, ec2):
     """LaunchTemplateData is No interruption on AWS::EC2::LaunchTemplate: AWS
     adds version N+1 under the same template. The create minted a new lt- id
