@@ -328,6 +328,140 @@ def test_cfn_ec2_subnet_update_keeps_id(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ec2_subnet_keeps_map_public_ip_when_the_property_is_removed(cfn, ec2):
+    """A template that stops setting MapPublicIpOnLaunch leaves the subnet's
+    attribute as it is: measured on AWS 2026-09-21, true stays true after the
+    property is removed. The update wrote the default false instead."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-map-{suffix}"
+
+    def template(extra):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.49.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.49.1.0/24", **extra}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"MapPublicIpOnLaunch": True}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        subnet_id = _cfn_output(cfn, stack_name, "SubnetId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "SubnetId") == subnet_id
+        described = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        assert described["MapPublicIpOnLaunch"] is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_create_only_members_replace_the_subnet(cfn, ec2):
+    """AvailabilityZoneId, the IPAM members, Ipv6Native and OutpostArn are
+    create-only on AWS::EC2::Subnet (the registry's createOnlyProperties).
+    The handler keyed its replacement on VpcId, CidrBlock and
+    AvailabilityZone alone, so a zone given by id was ignored at create and
+    its change applied as an in-place no-op."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-azid-{suffix}"
+
+    def template(zone_id):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.53.1.0/24",
+                    "AvailabilityZoneId": zone_id}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("use1-az2"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = _cfn_output(cfn, stack_name, "SubnetId")
+        subnet = ec2.describe_subnets(SubnetIds=[before])["Subnets"][0]
+        assert (subnet["AvailabilityZoneId"], subnet["AvailabilityZone"]) == ("use1-az2", "us-east-1b")
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("use1-az3"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        after = _cfn_output(cfn, stack_name, "SubnetId")
+        assert after != before
+        assert ec2.describe_subnets(SubnetIds=[after])["Subnets"][0]["AvailabilityZoneId"] == "use1-az3"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_dns_name_options_update_in_place(cfn, ec2):
+    """PrivateDnsNameOptionsOnLaunch is No interruption on AWS::EC2::Subnet.
+    AWS answers it (and EnableDns64, Ipv6Native, AssignIpv6AddressOnCreation,
+    false by default) in DescribeSubnets, applies a change in place, keeps
+    the value when the template removes the property, and fails EnableDns64
+    on a subnet without an IPv6 block (measured 2026-09-21). None of the
+    four was stored or answered."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-dns-{suffix}"
+
+    def template(extra):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.55.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.55.1.0/24", **extra}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    def attributes(subnet_id):
+        subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        return {key: subnet.get(key) for key in (
+            "PrivateDnsNameOptionsOnLaunch", "EnableDns64", "Ipv6Native",
+            "AssignIpv6AddressOnCreation")}
+
+    def options(hostname_type, a_record):
+        return {"HostnameType": hostname_type, "EnableResourceNameDnsARecord": a_record,
+                "EnableResourceNameDnsAAAARecord": False}
+
+    resource_name = {"HostnameType": "resource-name", "EnableResourceNameDnsARecord": True}
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        {"PrivateDnsNameOptionsOnLaunch": resource_name}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        subnet_id = _cfn_output(cfn, stack_name, "SubnetId")
+        defaults = {"EnableDns64": False, "Ipv6Native": False, "AssignIpv6AddressOnCreation": False}
+        assert attributes(subnet_id) == {
+            "PrivateDnsNameOptionsOnLaunch": options("resource-name", True), **defaults}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({
+            "PrivateDnsNameOptionsOnLaunch": {
+                "HostnameType": "ip-name", "EnableResourceNameDnsARecord": False}}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "SubnetId") == subnet_id
+        assert attributes(subnet_id)["PrivateDnsNameOptionsOnLaunch"] == options("ip-name", False)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            {"PrivateDnsNameOptionsOnLaunch": resource_name}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert attributes(subnet_id)["PrivateDnsNameOptionsOnLaunch"] == options("resource-name", True)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({"EnableDns64": True}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "")
+                   for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Subnet" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert reasons and "Property Ipv6CidrBlock or Ipv6IpamPoolId cannot be empty." in reasons[0]
+        assert attributes(subnet_id)["EnableDns64"] is False
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_security_group_update_keeps_id_and_rules(cfn, ec2):
     """SecurityGroupIngress is "Some interruptions" on
     AWS::EC2::SecurityGroup, which is an in-place update, and Tags is No

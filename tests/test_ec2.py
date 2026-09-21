@@ -1379,6 +1379,42 @@ def test_ec2_modify_vpc_attribute(ec2):
     ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
     ec2.delete_vpc(VpcId=vpc_id)
 
+
+def test_ec2_subnet_dns_and_ipv6_attributes_read_back(ec2):
+    """DescribeSubnets answers PrivateDnsNameOptionsOnLaunch, EnableDns64,
+    Ipv6Native and AssignIpv6AddressOnCreation on AWS (false and "ip-name"
+    for a subnet created without them), and ModifySubnetAttribute changes the
+    DNS name options one member at a time. None of the four was answered or
+    stored."""
+    vpc_id = subnet_id = None
+    try:
+        vpc_id = ec2.create_vpc(CidrBlock="10.61.0.0/16")["Vpc"]["VpcId"]
+        subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.61.1.0/24")["Subnet"]["SubnetId"]
+
+        def attributes():
+            subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+            return {key: subnet.get(key) for key in (
+                "PrivateDnsNameOptionsOnLaunch", "EnableDns64", "Ipv6Native",
+                "AssignIpv6AddressOnCreation")}
+
+        assert attributes() == {
+            "PrivateDnsNameOptionsOnLaunch": {
+                "HostnameType": "ip-name", "EnableResourceNameDnsARecord": False,
+                "EnableResourceNameDnsAAAARecord": False},
+            "EnableDns64": False, "Ipv6Native": False, "AssignIpv6AddressOnCreation": False}
+        ec2.modify_subnet_attribute(SubnetId=subnet_id, PrivateDnsHostnameTypeOnLaunch="resource-name")
+        ec2.modify_subnet_attribute(SubnetId=subnet_id,
+                                    EnableResourceNameDnsARecordOnLaunch={"Value": True})
+        assert attributes()["PrivateDnsNameOptionsOnLaunch"] == {
+            "HostnameType": "resource-name", "EnableResourceNameDnsARecord": True,
+            "EnableResourceNameDnsAAAARecord": False}
+    finally:
+        if subnet_id:
+            ec2.delete_subnet(SubnetId=subnet_id)
+        if vpc_id:
+            ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_modify_subnet_attribute(ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.11.0.0/16")["Vpc"]["VpcId"]
     subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.11.1.0/24")["Subnet"]["SubnetId"]

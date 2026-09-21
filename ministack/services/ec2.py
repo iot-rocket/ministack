@@ -3128,14 +3128,37 @@ def _describe_vpc_classic_link_dns_support(p):
     return _xml(200, "DescribeVpcClassicLinkDnsSupportResponse", "<vpcs/>")
 
 
+def _subnet_dns_name_options(subnet):
+    """A subnet's PrivateDnsNameOptionsOnLaunch, with AWS's defaults for a
+    subnet created without them: IP-based host names, no resource-name DNS
+    records."""
+    return subnet.get("PrivateDnsNameOptionsOnLaunch") or {
+        "HostnameType": "ip-name",
+        "EnableResourceNameDnsARecord": False,
+        "EnableResourceNameDnsAAAARecord": False,
+    }
+
+
 def _modify_subnet_attribute(p):
     subnet_id = _p(p, "SubnetId")
     if subnet_id not in _subnets:
         return _error("InvalidSubnetID.NotFound",
                       f"The subnet ID '{subnet_id}' does not exist", 400)
+    subnet = _subnets[subnet_id]
     val = _p(p, "MapPublicIpOnLaunch.Value")
     if val:
-        _subnets[subnet_id]["MapPublicIpOnLaunch"] = val.lower() == "true"
+        subnet["MapPublicIpOnLaunch"] = val.lower() == "true"
+    # One DNS name option per call, as on AWS; the others keep their values.
+    options = dict(_subnet_dns_name_options(subnet))
+    hostname_type = _p(p, "PrivateDnsHostnameTypeOnLaunch")
+    if hostname_type:
+        options["HostnameType"] = hostname_type
+    for member in ("EnableResourceNameDnsARecord", "EnableResourceNameDnsAAAARecord"):
+        val = _p(p, f"{member}OnLaunch.Value")
+        if val:
+            options[member] = val.lower() == "true"
+    if options != _subnet_dns_name_options(subnet):
+        subnet["PrivateDnsNameOptionsOnLaunch"] = options
     return _xml(200, "ModifySubnetAttributeResponse", "<return>true</return>")
 
 
@@ -4320,6 +4343,9 @@ def _vpc_xml(vpc):
 
 
 def _subnet_fields_xml(subnet, tag="item"):
+    # A subnet has no IPv6 block here, so it is never IPv6-native and assigns
+    # no IPv6 address on creation; DescribeSubnets answers both as false.
+    dns_options = _subnet_dns_name_options(subnet)
     return f"""<{tag}>
         <subnetId>{subnet['SubnetId']}</subnetId>
         <subnetArn>arn:aws:ec2:{get_region()}:{get_account_id()}:subnet/{subnet['SubnetId']}</subnetArn>
@@ -4332,6 +4358,14 @@ def _subnet_fields_xml(subnet, tag="item"):
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
+        <assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation>
+        <enableDns64>{'true' if subnet.get('EnableDns64') else 'false'}</enableDns64>
+        <ipv6Native>false</ipv6Native>
+        <privateDnsNameOptionsOnLaunch>
+            <hostnameType>{dns_options['HostnameType']}</hostnameType>
+            <enableResourceNameDnsARecord>{'true' if dns_options['EnableResourceNameDnsARecord'] else 'false'}</enableResourceNameDnsARecord>
+            <enableResourceNameDnsAAAARecord>{'true' if dns_options['EnableResourceNameDnsAAAARecord'] else 'false'}</enableResourceNameDnsAAAARecord>
+        </privateDnsNameOptionsOnLaunch>
         {_tag_set_xml(subnet['SubnetId'])}
     </{tag}>"""
 

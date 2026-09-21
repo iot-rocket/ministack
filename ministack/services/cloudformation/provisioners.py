@@ -7140,10 +7140,53 @@ def _ec2_vpc_endpoint_delete(physical_id, props):
     _ec2._tags.pop(physical_id, None)
 
 
+# Create-only on AWS::EC2::Subnet beside VpcId, CidrBlock and the zone (the
+# registry's createOnlyProperties); the record keeps none of them.
+_EC2_SUBNET_CREATE_ONLY = (
+    "Ipv4IpamPoolId", "Ipv4NetmaskLength", "Ipv6IpamPoolId", "Ipv6Native",
+    "Ipv6NetmaskLength", "OutpostArn",
+)
+
+
+def _ec2_subnet_zone(props):
+    """The subnet's zone name: AvailabilityZone, or the zone AvailabilityZoneId
+    names, as CreateSubnet resolves it; the create ignored the id."""
+    if props.get("AvailabilityZone"):
+        return props["AvailabilityZone"]
+    if props.get("AvailabilityZoneId"):
+        zone = _ec2._zone_name_for_az_id(props["AvailabilityZoneId"])
+        if zone:
+            return zone
+    return f"{get_region()}a"
+
+
+def _ec2_subnet_attributes(subnet, props):
+    """PrivateDnsNameOptionsOnLaunch and EnableDns64 onto the record, in the
+    shape DescribeSubnets renders. Only the members the template sets are
+    written: AWS keeps a removed one as it is (measured 2026-09-21, as for
+    MapPublicIpOnLaunch). EnableDns64 needs an IPv6 block, which no subnet
+    here has; AWS fails the operation with the handler's message."""
+    if str(props.get("EnableDns64", False)).lower() == "true" and not (
+            props.get("Ipv6CidrBlock") or props.get("Ipv6IpamPoolId")):
+        raise ValueError("Invalid request provided: Property Ipv6CidrBlock or "
+                         "Ipv6IpamPoolId cannot be empty.")
+    if "EnableDns64" in props:
+        subnet["EnableDns64"] = str(props["EnableDns64"]).lower() == "true"
+    options = props.get("PrivateDnsNameOptionsOnLaunch")
+    if isinstance(options, dict):
+        current = dict(_ec2._subnet_dns_name_options(subnet))
+        if "HostnameType" in options:
+            current["HostnameType"] = options["HostnameType"]
+        for member in ("EnableResourceNameDnsARecord", "EnableResourceNameDnsAAAARecord"):
+            if member in options:
+                current[member] = str(options[member]).lower() == "true"
+        subnet["PrivateDnsNameOptionsOnLaunch"] = current
+
+
 def _ec2_subnet_create(logical_id, props, stack_name):
     vpc_id = props.get("VpcId", "")
     cidr = props.get("CidrBlock", "10.0.1.0/24")
-    az = props.get("AvailabilityZone", f"{get_region()}a")
+    az = _ec2_subnet_zone(props)
     subnet_id = _ec2._new_subnet_id()
     _ec2._subnets[subnet_id] = {
         "SubnetId": subnet_id,
@@ -7154,14 +7197,69 @@ def _ec2_subnet_create(logical_id, props, stack_name):
         "State": "available",
         "AvailableIpAddressCount": 251,
         "DefaultForAz": False,
-        "MapPublicIpOnLaunch": props.get("MapPublicIpOnLaunch", False),
+        "MapPublicIpOnLaunch": _ec2_subnet_public_ip(props),
         "OwnerId": get_account_id(),
     }
+    try:
+        _ec2_subnet_attributes(_ec2._subnets[subnet_id], props)
+    except ValueError:
+        _ec2._subnets.pop(subnet_id, None)
+        raise
+    _ec2_apply_tags(subnet_id, props)
     return subnet_id, {"SubnetId": subnet_id, "AvailabilityZone": az}
+
+
+def _ec2_subnet_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a subnet in place. AssignIpv6AddressOnCreation, EnableDns64,
+    EnableLniAtDeviceIndex, MapPublicIpOnLaunch, PrivateDnsNameOptionsOnLaunch
+    and Tags are No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet.html);
+    VpcId, CidrBlock, the zone (by name or id), the IPAM members, Ipv6Native
+    and OutpostArn are Replacement (the registry's createOnlyProperties) and
+    are read as one key.
+
+    The create mints a new subnet- id, so the fallback replaced the subnet and
+    left every instance, network interface, NAT gateway and load balancer
+    subnet list holding an id that no longer resolves."""
+    subnet = _ec2._subnets.get(physical_id)
+    key = (new_props.get("VpcId", ""),
+           new_props.get("CidrBlock", "10.0.1.0/24"),
+           _ec2_subnet_zone(new_props),
+           *(new_props.get(p) for p in _EC2_SUBNET_CREATE_ONLY))
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        key,
+        (subnet["VpcId"], subnet["CidrBlock"], subnet["AvailabilityZone"],
+         *(old_props.get(p) for p in _EC2_SUBNET_CREATE_ONLY))
+        if subnet else None,
+        _ec2_subnet_create, _ec2_subnet_delete,
+    )
+    if replaced is not None:
+        return replaced
+    # A template that stops setting one of these leaves the attribute as it
+    # is: on AWS a removed MapPublicIpOnLaunch keeps reading true, and so does
+    # a removed PrivateDnsNameOptionsOnLaunch (measured 2026-09-21), unlike a
+    # VPC's DNS attributes. AssignIpv6AddressOnCreation and
+    # EnableLniAtDeviceIndex have nothing to act on without an IPv6 block or
+    # an Outpost, neither of which is modelled.
+    _ec2_subnet_attributes(subnet, new_props)
+    if "MapPublicIpOnLaunch" in new_props:
+        subnet["MapPublicIpOnLaunch"] = _ec2_subnet_public_ip(new_props)
+    _ec2_apply_tags(physical_id, new_props, old_props)
+    return physical_id, {"SubnetId": physical_id,
+                         "AvailabilityZone": subnet["AvailabilityZone"]}
+
+
+def _ec2_subnet_public_ip(props):
+    """MapPublicIpOnLaunch as a boolean: DescribeSubnets renders the record's
+    truthiness, so a YAML template's string "false" read back as true."""
+    value = props.get("MapPublicIpOnLaunch", False)
+    return value if isinstance(value, bool) else str(value).lower() == "true"
 
 
 def _ec2_subnet_delete(physical_id, props):
     _ec2._subnets.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 def _ec2_sg_create(logical_id, props, stack_name):
@@ -11435,7 +11533,12 @@ _RESOURCE_HANDLERS = {
         "update": _ec2_vpc_endpoint_update,
         "delete": _ec2_vpc_endpoint_delete,
     },
-    "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
+    "AWS::EC2::Subnet": {
+        "create": _ec2_subnet_create,
+        "update": _ec2_subnet_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_subnet_delete,
+    },
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
