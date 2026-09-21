@@ -17288,6 +17288,90 @@ def _cfn_appsync_members_template(name, api_props, oidc):
     })
 
 
+def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
+    """ClusterSettings, DefaultCapacityProviderStrategy and Configuration were
+    stored in the template's PascalCase while DescribeClusters serializes the
+    API's camelCase, so botocore dropped every member and answered a list of
+    empty objects, before and after any update. The cluster itself needs no
+    update handler: the create rebuilds the record from the template and
+    DescribeClusters recomputes the counters. Measured on AWS 2026-09-21 (with
+    include SETTINGS and CONFIGURATIONS): containerInsights enabled, FARGATE
+    weight 1 base 0, executeCommandConfiguration logging DEFAULT -> NONE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-cl-{suffix}"
+    cluster = f"cfn-ecs-cl-{suffix}"
+
+    def template(setting, logging):
+        return json.dumps({
+            "Resources": {
+                "Cluster": {
+                    "Type": "AWS::ECS::Cluster",
+                    "Properties": {
+                        "ClusterName": cluster,
+                        "ClusterSettings": [
+                            {"Name": "containerInsights", "Value": setting},
+                        ],
+                        "CapacityProviders": ["FARGATE"],
+                        "DefaultCapacityProviderStrategy": [
+                            {"CapacityProvider": "FARGATE", "Weight": 1, "Base": 0},
+                        ],
+                        "Configuration": {
+                            "ExecuteCommandConfiguration": {"Logging": logging},
+                        },
+                        "Tags": [{"Key": "stage", "Value": setting}],
+                    },
+                },
+                "TD": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": f"cfn-ecs-td-{suffix}",
+                        "ContainerDefinitions": [
+                            {"Name": "app", "Image": "nginx", "Memory": 128},
+                        ],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": f"cfn-ecs-svc-{suffix}",
+                        "TaskDefinition": {"Ref": "TD"},
+                        "DesiredCount": 1,
+                    },
+                },
+            },
+        })
+
+    def described():
+        return ecs.describe_clusters(
+            clusters=[cluster], include=["SETTINGS", "CONFIGURATIONS"])["clusters"][0]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("disabled", "DEFAULT"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        before = described()
+        assert before["settings"] == [{"name": "containerInsights", "value": "disabled"}]
+        assert before["defaultCapacityProviderStrategy"] == [
+            {"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+        assert before["configuration"] == {
+            "executeCommandConfiguration": {"logging": "DEFAULT"}}
+        assert before["activeServicesCount"] == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("enabled", "NONE"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        after = described()
+        assert after["settings"] == [
+            {"name": "containerInsights", "value": "enabled"}]
+        assert after["configuration"] == {
+            "executeCommandConfiguration": {"logging": "NONE"}}
+        assert after["activeServicesCount"] == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # In-place update handlers — deploy, update a mutable property, assert the
 # physical id survived and the new value is visible through the service API

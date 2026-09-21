@@ -7634,11 +7634,18 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "runningTasksCount": 0,
         "pendingTasksCount": 0,
         "activeServicesCount": 0,
-        "settings": props.get("ClusterSettings", []),
+        # ECS is a JSON API with camelCase members: kept in the template's
+        # PascalCase, botocore dropped every member and DescribeClusters
+        # answered [{}] for the settings and the strategy.
+        "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
-        "defaultCapacityProviderStrategy": props.get("DefaultCapacityProviderStrategy", []),
+        "defaultCapacityProviderStrategy": _pascal_to_camel(
+            props.get("DefaultCapacityProviderStrategy") or []),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     }
+    if props.get("Configuration"):
+        # Where UpdateCluster keeps it, in the same shape.
+        _ecs._clusters[name]["configuration"] = _pascal_to_camel(props["Configuration"])
     return name, {"Arn": arn, "ClusterName": name}
 
 
