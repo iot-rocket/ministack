@@ -1065,6 +1065,58 @@ def test_cfn_ec2_network_tag_change_keeps_tags_added_through_the_api(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ec2_networking_resources_carry_the_stack_tags(cfn, ec2):
+    """A VPC, subnet, security group, internet gateway and route table carry
+    the three aws:cloudformation:* tags and the stack-level tags beside their
+    own, and a stack-tag change reaches them (measured on AWS 2026-09-21).
+    The five types were missing from the stack-tag table, so they carried the
+    template's tags only."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-net-stack-tags-{suffix}"
+    own = [{"Key": "own", "Value": "a"}]
+    template = json.dumps({
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.63.0.0/16", "Tags": own}},
+            "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.63.1.0/24", "Tags": own}},
+            "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "stack tags", "VpcId": {"Ref": "Vpc"}, "Tags": own}},
+            "Igw": {"Type": "AWS::EC2::InternetGateway", "Properties": {"Tags": own}},
+            "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {"VpcId": {"Ref": "Vpc"}, "Tags": own}},
+        },
+        "Outputs": {
+            "Vpc": {"Value": {"Ref": "Vpc"}}, "Subnet": {"Value": {"Ref": "Subnet"}},
+            "Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}},
+            "Igw": {"Value": {"Ref": "Igw"}}, "Rtb": {"Value": {"Ref": "Rtb"}},
+        },
+    })
+
+    def tags_of(resource_id):
+        return {t["Key"]: t["Value"] for t in ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [resource_id]}])["Tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     Tags=[{"Key": "stage", "Value": "one"}])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ids = {key: _cfn_output(cfn, stack_name, key) for key in ("Vpc", "Subnet", "Sg", "Igw", "Rtb")}
+        for logical_id, resource_id in ids.items():
+            assert tags_of(resource_id) == {
+                "own": "a", "stage": "one",
+                "aws:cloudformation:stack-name": stack_name,
+                "aws:cloudformation:stack-id": stack["StackId"],
+                "aws:cloudformation:logical-id": logical_id,
+            }, logical_id
+        cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        for logical_id, resource_id in ids.items():
+            assert tags_of(resource_id)["stage"] == "two", logical_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_route_target_change_does_not_duplicate(cfn, ec2):
     """The physical id of AWS::EC2::Route is "{table}|{destination}", so a
     changed target leaves it unmoved and the engine declares no replacement.
