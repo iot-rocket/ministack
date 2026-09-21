@@ -948,6 +948,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::AppConfig::Deployment": ("Tags", "list"),
     "AWS::AppConfig::DeploymentStrategy": ("Tags", "list"),
     "AWS::AppConfig::Environment": ("Tags", "list"),
+    "AWS::AppSync::GraphQLApi": ("Tags", "list"),
     "AWS::AutoScaling::AutoScalingGroup": ("Tags", "list"),
     "AWS::Backup::BackupPlan": ("BackupPlanTags", "map"),
     "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
@@ -5606,26 +5607,123 @@ def _sns_topic_policy_delete(physical_id, props):
 
 # --- AppSync resource provisioners ---
 
+# The GraphQLApi members that map one to one onto a camelCase API member and
+# are absent from the API when the template does not set them.
+_APPSYNC_API_OPTIONAL = (
+    "AdditionalAuthenticationProviders", "EnhancedMetricsConfig",
+    "LambdaAuthorizerConfig", "LogConfig", "MergedApiExecutionRoleArn",
+    "OpenIDConnectConfig", "OwnerContact", "UserPoolConfig",
+)
+
+
+def _appsync_api_members(props):
+    """A GraphQLApi's properties as the API record's members. The scalar
+    members take AppSync's defaults when the template leaves them out, which
+    is what GetGraphqlApi answers on AWS for an API created without them, and
+    after an update that removed them (measured 2026-09-21); the others are
+    set only when present. AppSync is rest-json, so a nested member is stored
+    in the API's camelCase: kept in the template's PascalCase, botocore reads
+    [{}]."""
+    members = {
+        "authenticationType": props.get("AuthenticationType", "API_KEY"),
+        "xrayEnabled": str(props.get("XrayEnabled", False)).lower() == "true",
+        "apiType": props.get("ApiType", "GRAPHQL"),
+        "visibility": props.get("Visibility", "GLOBAL"),
+        "introspectionConfig": props.get("IntrospectionConfig", "ENABLED"),
+        "queryDepthLimit": int(props.get("QueryDepthLimit", 0)),
+        "resolverCountLimit": int(props.get("ResolverCountLimit", 0)),
+    }
+    for prop in _APPSYNC_API_OPTIONAL:
+        if props.get(prop) not in (None, "", [], {}):
+            members[prop[:1].lower() + prop[1:]] = _pascal_to_camel(props[prop])
+    oidc = members.get("openIDConnectConfig")
+    if oidc is not None:
+        # AppSync answers both TTLs, 0 when unset (measured 2026-09-21).
+        oidc.setdefault("authTTL", 0)
+        oidc.setdefault("iatTTL", 0)
+    # A map of the caller's own names: its keys are not converted.
+    if props.get("EnvironmentVariables"):
+        members["environmentVariables"] = dict(props["EnvironmentVariables"])
+    return members
+
+
+def _appsync_api_tags(props):
+    """The tags AppSync lists for the API: the template's and the stack-level
+    ones, without the aws:cloudformation:* tags, which AppSync does not list
+    on an API CloudFormation created (measured 2026-09-21)."""
+    return {"Tags": [t for t in (props.get("Tags") or [])
+                     if isinstance(t, dict) and not str(t.get("Key", "")).startswith("aws:")]}
+
+
 def _appsync_api_create(logical_id, props, stack_name):
     import time as _time
     name = props.get("Name") or _physical_name(stack_name, logical_id)
-    auth_type = props.get("AuthenticationType", "API_KEY")
-    api_id = new_uuid()[:8]
+    # The id shape CreateGraphqlApi mints; eight characters made an ARN that
+    # botocore refuses as too short for ListTagsForResource.
+    api_id = new_uuid().replace("-", "")[:26]
     arn = f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}"
     now = _time.time()
     _appsync._apis[api_id] = {
-        "apiId": api_id, "name": name, "authenticationType": auth_type,
+        "apiId": api_id, "name": name,
         "arn": arn,
-        "uris": {"GRAPHQL": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql"},
+        "uris": {
+            "GRAPHQL": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql",
+            "REALTIME": f"wss://{api_id}.appsync-realtime-api.{get_region()}.amazonaws.com/graphql",
+        },
         "createdAt": now, "lastUpdatedAt": now,
-        "additionalAuthenticationProviders": props.get("AdditionalAuthenticationProviders", []),
-        "xrayEnabled": False,
+        **_appsync_api_members(props),
     }
+    tags = _tag_map(_appsync_api_tags(props)["Tags"])
+    if tags:
+        _appsync._tags[arn] = tags
     _appsync._api_keys[api_id] = {}
     _appsync._data_sources[api_id] = {}
     _appsync._resolvers[api_id] = {}
     _appsync._types[api_id] = {}
     return api_id, {"ApiId": api_id, "Arn": arn, "GraphQLUrl": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql"}
+
+
+def _appsync_api_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a GraphQL API in place. Every property of the type is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appsync-graphqlapi.html),
+    so the API is never replaced and keeps its id, ARN and endpoint URLs.
+    Visibility is the exception the page does not state: AWS fails the update
+    with the handler's message (measured 2026-09-21). An OpenIDConnectConfig
+    ClientId or Issuer change is in place (the registry lists the nested
+    members as conditionally create-only; measured the same day), and a
+    member the template removes goes back to its default or away.
+
+    This is the worst of the create-fallbacks: the create mints a new api id
+    AND re-seeds _api_keys, _data_sources, _resolvers and _types for it, so a
+    renamed API came back empty while the real one was orphaned under the old
+    id, still holding every child the stack had provisioned."""
+    import time as _time
+    api = _appsync._apis.get(physical_id)
+    if api is None:
+        return _appsync_api_create(logical_id or physical_id, new_props, stack_name)
+    members = _appsync_api_members(new_props)
+    if members["visibility"] != api.get("visibility", "GLOBAL"):
+        raise ValueError(
+            "Property Visibility can only be set when creating a GraphQL API. "
+            "Rename the resource to force a replacement")
+    if new_props.get("Name"):
+        api["name"] = new_props["Name"]
+    # UpdateGraphqlApi has no apiType member; a change is not applied.
+    members.pop("apiType")
+    for prop in (*_APPSYNC_API_OPTIONAL, "EnvironmentVariables"):
+        api.pop(prop[:1].lower() + prop[1:], None)
+    api.update(members)
+    tags = _appsync._tags.setdefault(api["arn"], {})
+    _reconcile_tag_map(tags, _appsync_api_tags(old_props), _appsync_api_tags(new_props))
+    if not tags:
+        _appsync._tags.pop(api["arn"], None)
+    api["lastUpdatedAt"] = _time.time()
+    return physical_id, {
+        "ApiId": physical_id,
+        "Arn": api["arn"],
+        "GraphQLUrl": api["uris"]["GRAPHQL"],
+    }
 
 
 def _appsync_api_delete(physical_id, props):
@@ -5753,11 +5851,44 @@ def _appsync_apikey_create(logical_id, props, stack_name):
     import time
     key = {
         "id": key_id, "apiKeyId": key_id,
+        # description and createdAt are part of the record CreateApiKey
+        # writes, so ListApiKeys answered a stunted one for a key the
+        # template had created, and a Description change was unobservable.
+        "description": props.get("Description", ""),
         "expires": props.get("Expires", int(time.time()) + 604800),
+        "createdAt": int(time.time()),
     }
     _appsync._api_keys.setdefault(api_id, {})[key_id] = key
     return key_id, {"ApiKeyId": key_id, "ApiKey": key_id,
                     "Arn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/apikeys/{key_id}"}
+
+
+def _appsync_apikey_update(physical_id, old_props, new_props, stack_name,
+                           logical_id=None):
+    """Update an API key in place. Description and Expires are No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appsync-apikey.html);
+    ApiId is Replacement.
+
+    The create mints a fresh key id, so under the fallback every expiry change
+    handed clients a new key and left the previous one valid on the API."""
+    import time
+    api_id = new_props.get("ApiId", "")
+    old_api_id = old_props.get("ApiId", "")
+    key = _appsync._api_keys.get(old_api_id, {}).get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        api_id, old_api_id if key else None,
+        _appsync_apikey_create, _appsync_apikey_delete,
+    )
+    if replaced is not None:
+        return replaced
+    key["description"] = new_props.get("Description", "")
+    key["expires"] = new_props.get("Expires", int(time.time()) + 604800)
+    return physical_id, {
+        "ApiKeyId": physical_id, "ApiKey": physical_id,
+        "Arn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/apikeys/{physical_id}",
+    }
 
 
 def _appsync_apikey_delete(physical_id, props):
@@ -10941,7 +11072,12 @@ _RESOURCE_HANDLERS = {
         "update": _sns_topic_policy_update,
         "delete": _sns_topic_policy_delete,
     },
-    "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
+    "AWS::AppSync::GraphQLApi": {
+        "create": _appsync_api_create,
+        "update": _appsync_api_update,
+        "update_with_logical_id": True,
+        "delete": _appsync_api_delete,
+    },
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
     "AWS::AppSync::FunctionConfiguration": {
         "create": _appsync_function_create,
@@ -10950,7 +11086,12 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
-    "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
+    "AWS::AppSync::ApiKey": {
+        "create": _appsync_apikey_create,
+        "update": _appsync_apikey_update,
+        "update_with_logical_id": True,
+        "delete": _appsync_apikey_delete,
+    },
     "AWS::SecretsManager::Secret": {
         "create": _sm_secret_create,
         "update": _sm_secret_update,

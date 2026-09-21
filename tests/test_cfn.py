@@ -17186,6 +17186,20 @@ def _cfn_output(cfn, stack_name, key):
                 if o["OutputKey"] == key)
 
 
+def _cfn_appsync_members_template(name, api_props, oidc):
+    return json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::AppSync::GraphQLApi", "Properties": {
+                "Name": f"{name}_a", "AuthenticationType": "API_KEY", **api_props}},
+            "Oidc": {"Type": "AWS::AppSync::GraphQLApi", "Properties": {
+                "Name": f"{name}_b", "AuthenticationType": "OPENID_CONNECT",
+                "OpenIDConnectConfig": oidc}},
+        },
+        "Outputs": {"ApiId": {"Value": {"Fn::GetAtt": ["Api", "ApiId"]}},
+                    "OidcId": {"Value": {"Fn::GetAtt": ["Oidc", "ApiId"]}}},
+    })
+
+
 # ===========================================================================
 # In-place update handlers — deploy, update a mutable property, assert the
 # physical id survived and the new value is visible through the service API
