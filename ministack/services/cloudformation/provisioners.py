@@ -9606,13 +9606,7 @@ def _asg_create(logical_id, props, stack_name):
         "Tags": [],
         "Status": "",
     }
-    lt = props.get("LaunchTemplate", {})
-    if lt:
-        asg["LaunchTemplate"] = {
-            "LaunchTemplateId": lt.get("LaunchTemplateId", lt.get("LaunchTemplateName", "")),
-            "LaunchTemplateName": lt.get("LaunchTemplateName", ""),
-            "Version": lt.get("Version", "$Default"),
-        }
+    asg["LaunchTemplate"] = _asg_launch_template(props.get("LaunchTemplate"))
     tags = []
     for t in props.get("Tags", []):
         tags.append({
@@ -9620,12 +9614,102 @@ def _asg_create(logical_id, props, stack_name):
             "Value": t.get("Value", ""),
             "ResourceId": name,
             "ResourceType": "auto-scaling-group",
-            "PropagateAtLaunch": t.get("PropagateAtLaunch", False),
+            "PropagateAtLaunch": _asg_propagate_at_launch(t),
         })
     asg["Tags"] = tags
     _asg._asgs[name] = asg
     _asg._tags[name] = tags
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
+
+
+def _asg_launch_template(spec):
+    """A group's LaunchTemplate as DescribeAutoScalingGroups answers it: the
+    template's id and name, whichever of the two the group was given, and the
+    version as given. A template references its launch template through Ref,
+    the id, and the provisioner copied only that, so LaunchTemplateName read
+    "" where AWS answers the real name (measured 2026-09-21)."""
+    if not spec:
+        return {}
+    lt_id = spec.get("LaunchTemplateId", "")
+    lt_name = spec.get("LaunchTemplateName", "")
+    record = _ec2._launch_templates.get(lt_id) if lt_id else next(
+        (t for t in _ec2._launch_templates.values()
+         if t.get("LaunchTemplateName") == lt_name), None)
+    if record:
+        lt_id, lt_name = record["LaunchTemplateId"], record["LaunchTemplateName"]
+    return {
+        "LaunchTemplateId": lt_id or lt_name,
+        "LaunchTemplateName": lt_name,
+        "Version": spec.get("Version", "$Default"),
+    }
+
+
+def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an Auto Scaling group in place. The sizes, cooldown, health
+    check, zones, subnets, termination policies, launch configuration and
+    launch template are No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-autoscalinggroup.html);
+    AutoScalingGroupName and InstanceId are Replacement (the registry's
+    createOnlyProperties).
+
+    The create mints a fresh ARN off a uuid, re-stamps CreatedTime and resets
+    Instances to an empty list, so the fallback handed every consumer of the
+    ARN a new value and dropped the group's instances on a size change."""
+    name = new_props.get("AutoScalingGroupName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=255)
+    asg = _asg._asgs.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (name, new_props.get("InstanceId")),
+        (asg["AutoScalingGroupName"], old_props.get("InstanceId")) if asg else None,
+        _asg_create, _asg_delete,
+    )
+    if replaced is not None:
+        return replaced
+    asg["LaunchConfigurationName"] = new_props.get("LaunchConfigurationName", "")
+    asg["MinSize"] = int(new_props.get("MinSize", 0))
+    asg["MaxSize"] = int(new_props.get("MaxSize", 0))
+    asg["DesiredCapacity"] = int(
+        new_props.get("DesiredCapacity", new_props.get("MinSize", 0)))
+    asg["DefaultCooldown"] = int(new_props.get("Cooldown", 300))
+    asg["AvailabilityZones"] = new_props.get(
+        "AvailabilityZones", [f"{get_region()}a"])
+    asg["HealthCheckType"] = new_props.get("HealthCheckType", "EC2")
+    asg["HealthCheckGracePeriod"] = int(new_props.get("HealthCheckGracePeriod", 300))
+    zone_id = new_props.get("VPCZoneIdentifier", "")
+    asg["VPCZoneIdentifier"] = ",".join(zone_id) if isinstance(zone_id, list) else zone_id
+    asg["TerminationPolicies"] = new_props.get("TerminationPolicies", ["Default"])
+    asg["NewInstancesProtectedFromScaleIn"] = new_props.get(
+        "NewInstancesProtectedFromScaleIn", False)
+    asg["LaunchTemplate"] = _asg_launch_template(new_props.get("LaunchTemplate"))
+    # Reconciled rather than overwritten: a tag added through CreateOrUpdateTags
+    # survives a template tag change, as on AWS (measured 2026-09-21), and the
+    # template's own tags take its PropagateAtLaunch.
+    tags = _asg._tags.get(physical_id)
+    if tags is None:
+        tags = list(asg.get("Tags") or [])
+    _reconcile_tag_list(tags, old_props, new_props)
+    declared = {
+        str(t["Key"]): t for t in (new_props.get("Tags") or [])
+        if isinstance(t, dict) and "Key" in t
+    }
+    for tag in tags:
+        spec = declared.get(tag.get("Key"))
+        if spec is not None:
+            tag["ResourceId"] = physical_id
+            tag["ResourceType"] = "auto-scaling-group"
+            tag["PropagateAtLaunch"] = _asg_propagate_at_launch(spec)
+    asg["Tags"] = tags
+    _asg._tags[physical_id] = tags
+    arn = asg["AutoScalingGroupARN"]
+    return physical_id, {"AutoScalingGroupARN": arn, "Arn": arn}
+
+
+def _asg_propagate_at_launch(tag):
+    """A template tag's PropagateAtLaunch as a boolean; a YAML template can
+    carry it as the string "false", which is truthy."""
+    value = tag.get("PropagateAtLaunch", False)
+    return value if isinstance(value, bool) else str(value).lower() == "true"
 
 
 def _asg_delete(physical_id, props):
@@ -9653,21 +9737,56 @@ def _asg_lc_delete(physical_id, props):
     _asg._launch_configs.pop(physical_id, None)
 
 
+def _asg_policy_name(props, stack_name, logical_id):
+    """The registry lists PolicyName among the read-only attributes of
+    AWS::AutoScaling::ScalingPolicy, but AWS applies one the template sets
+    when it creates the policy (measured 2026-09-21: the policy carries
+    exactly that name), and never after: the update ignores it. Without one,
+    CloudFormation generates ``{stack}-{LogicalId}-{suffix}`` (measured the
+    same day)."""
+    return props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
+
+
 def _asg_policy_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
-    policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
+    policy_name = _asg_policy_name(props, stack_name, logical_id)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
-    _asg._policies[key] = {
-        "PolicyARN": arn,
-        "PolicyName": policy_name,
-        "AutoScalingGroupName": asg_name,
-        "PolicyType": props.get("PolicyType", "SimpleScaling"),
-        "AdjustmentType": props.get("AdjustmentType", "ChangeInCapacity"),
-        "ScalingAdjustment": int(props.get("ScalingAdjustment", 0)),
-        "Cooldown": int(props.get("Cooldown", 300)),
-    }
+    # The service's own record builder, so a target-tracking or step policy
+    # keeps its configuration the way PutScalingPolicy stores it.
+    _asg._policies[key] = _asg._policy_record(asg_name, policy_name, arn, props)
     return arn, {"Arn": arn, "PolicyName": policy_name}
+
+
+def _asg_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a scaling policy in place. AdjustmentType, Cooldown,
+    EstimatedInstanceWarmup, MetricAggregationType, MinAdjustmentMagnitude,
+    PolicyType, PredictiveScalingConfiguration, ScalingAdjustment,
+    StepAdjustments and TargetTrackingConfiguration are No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-scalingpolicy.html);
+    AutoScalingGroupName is Replacement. PolicyName is read-only in the
+    registry: a change or removal leaves the policy's name and ARN as they are
+    (measured 2026-09-21), so it is no part of the replacement key.
+
+    The physical id is the policy ARN and the create mints a new one off a
+    uuid, so the fallback answered a different Ref for an unchanged policy."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    current = next(
+        (p for p in _asg._policies.values() if p.get("PolicyARN") == physical_id), None)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        asg_name, current["AutoScalingGroupName"] if current else None,
+        _asg_policy_create, _asg_policy_delete,
+    )
+    if replaced is not None:
+        return replaced
+    # Rebuilt from the new properties rather than patched, so a member the
+    # template dropped (a step list, a warmup) goes with it.
+    record = _asg._policy_record(asg_name, current["PolicyName"], physical_id, new_props)
+    current.clear()
+    current.update(record)
+    return physical_id, {"Arn": physical_id, "PolicyName": current["PolicyName"]}
 
 
 def _asg_policy_delete(physical_id, props):
@@ -9700,27 +9819,69 @@ def _asg_hook_delete(physical_id, props):
 
 
 def _asg_scheduled_create(logical_id, props, stack_name):
+    """CloudFormation names a scheduled action itself and Ref answers that
+    name. The registry lists ScheduledActionName as read-only, and AWS
+    ignores one the template sets (measured 2026-09-21: the action carries a
+    generated name, and a changed or removed ScheduledActionName leaves it as
+    it is)."""
     asg_name = props.get("AutoScalingGroupName", "")
-    action_name = props.get("ScheduledActionName") or _physical_name(stack_name, logical_id, max_len=255)
+    action_name = _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
-    key = f"{asg_name}/{action_name}"
-    _asg._scheduled_actions[key] = {
-        "ScheduledActionARN": arn,
-        "ScheduledActionName": action_name,
-        "AutoScalingGroupName": asg_name,
-        "Recurrence": props.get("Recurrence", ""),
-        "MinSize": int(props.get("MinSize", -1)),
-        "MaxSize": int(props.get("MaxSize", -1)),
-        "DesiredCapacity": int(props.get("DesiredCapacity", -1)),
-    }
-    return arn, {"Arn": arn, "ScheduledActionName": action_name}
+    # The service's own record builder, as for a scaling policy.
+    _asg._scheduled_actions[f"{asg_name}/{action_name}"] = _asg._scheduled_action_record(
+        asg_name, action_name, arn, props)
+    return action_name, {"Arn": arn, "ScheduledActionName": action_name}
+
+
+def _asg_scheduled_find(physical_id, props):
+    """The store key and record of a scheduled action: by name within the
+    group the properties name, or by ARN, the physical id before Ref answered
+    the name."""
+    asg_name = props.get("AutoScalingGroupName", "")
+    for key, action in _asg._scheduled_actions.items():
+        if (action.get("ScheduledActionARN") == physical_id
+                or (action.get("ScheduledActionName") == physical_id
+                    and action.get("AutoScalingGroupName") == asg_name)):
+            return key, action
+    return None, None
+
+
+def _asg_scheduled_update(physical_id, old_props, new_props, stack_name,
+                          logical_id=None):
+    """Update a scheduled action in place. DesiredCapacity, EndTime, MaxSize,
+    MinSize, Recurrence, StartTime and TimeZone are No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-scheduledaction.html),
+    and AWS applies each in place with the ARN unchanged (measured
+    2026-09-21); AutoScalingGroupName is Replacement. ScheduledActionName is
+    read-only and ignored (see _asg_scheduled_create).
+
+    The create minted a new ARN on every change, so an unchanged action came
+    back under a new identity."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    _key, current = _asg_scheduled_find(physical_id, old_props)
+    # The replacement keeps the generated name, so the physical id does not
+    # move and the predecessor in the old group has to go explicitly.
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        asg_name, current["AutoScalingGroupName"] if current else None,
+        _asg_scheduled_create, _asg_scheduled_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
+    record = _asg._scheduled_action_record(
+        asg_name, current["ScheduledActionName"], current["ScheduledActionARN"], new_props)
+    current.clear()
+    current.update(record)
+    return physical_id, {"Arn": current["ScheduledActionARN"],
+                         "ScheduledActionName": current["ScheduledActionName"]}
 
 
 def _asg_scheduled_delete(physical_id, props):
-    for k, v in list(_asg._scheduled_actions.items()):
-        if v.get("ScheduledActionARN") == physical_id:
-            _asg._scheduled_actions.pop(k, None)
-            break
+    key, _action = _asg_scheduled_find(physical_id, props)
+    if key is not None:
+        _asg._scheduled_actions.pop(key, None)
 
 
 # Resource Handler Registry
@@ -11383,9 +11544,24 @@ _RESOURCE_HANDLERS = {
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling
-    "AWS::AutoScaling::AutoScalingGroup": {"create": _asg_create, "delete": _asg_delete},
+    "AWS::AutoScaling::AutoScalingGroup": {
+        "create": _asg_create,
+        "update": _asg_update,
+        "update_with_logical_id": True,
+        "delete": _asg_delete,
+    },
     "AWS::AutoScaling::LaunchConfiguration": {"create": _asg_lc_create, "delete": _asg_lc_delete},
-    "AWS::AutoScaling::ScalingPolicy": {"create": _asg_policy_create, "delete": _asg_policy_delete},
+    "AWS::AutoScaling::ScalingPolicy": {
+        "create": _asg_policy_create,
+        "update": _asg_policy_update,
+        "update_with_logical_id": True,
+        "delete": _asg_policy_delete,
+    },
     "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
-    "AWS::AutoScaling::ScheduledAction": {"create": _asg_scheduled_create, "delete": _asg_scheduled_delete},
+    "AWS::AutoScaling::ScheduledAction": {
+        "create": _asg_scheduled_create,
+        "update": _asg_scheduled_update,
+        "update_with_logical_id": True,
+        "delete": _asg_scheduled_delete,
+    },
 }

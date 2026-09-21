@@ -49,6 +49,14 @@ _FAILING_RESOURCE = {
 }
 
 
+def _cfn_with_failing_resource(body, depends_on):
+    """The template ``body`` plus _FAILING_RESOURCE after ``depends_on``, so
+    an update to it fails once that resource is updated and rolls back."""
+    template = json.loads(body)
+    template["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": depends_on}
+    return json.dumps(template)
+
+
 def _wait_stack(cfn, name, timeout=30):
     """Poll until stack reaches terminal status.
 
