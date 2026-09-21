@@ -7652,8 +7652,21 @@ def _ec2_launch_template_create(logical_id, props, stack_name):
         "DefaultVersionNumber": 1,
         "LatestVersionNumber": 1,
         "Versions": [version],
-        "Tags": [{"Key": t["Key"], "Value": t["Value"]} for t in props.get("Tags", [])],
     }
+    # The type has no Tags property: the template's own tags come from the
+    # TagSpecifications entry for "launch-template", the rest of which tag
+    # what the template launches. Kept where CreateLaunchTemplate keeps them
+    # (the record and the tag store share one list), so CreateTags stays
+    # visible; the dead Tags read left every template untagged.
+    tags = [
+        {"Key": str(t.get("Key", "")), "Value": str(t.get("Value", ""))}
+        for spec in (props.get("TagSpecifications") or [])
+        if isinstance(spec, dict) and spec.get("ResourceType") == "launch-template"
+        for t in (spec.get("Tags") or []) if isinstance(t, dict)
+    ]
+    if tags:
+        lt["Tags"] = tags
+        _ec2._tags[lt_id] = tags
     _ec2._launch_templates[lt_id] = lt
     return lt_id, {
         "LaunchTemplateId": lt_id,
@@ -7663,8 +7676,56 @@ def _ec2_launch_template_create(logical_id, props, stack_name):
     }
 
 
+def _ec2_launch_template_update(physical_id, old_props, new_props, stack_name,
+                                logical_id=None):
+    """Update a launch template in place. LaunchTemplateData, TagSpecifications
+    and VersionDescription are No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-launchtemplate.html)
+    and LaunchTemplateName is Replacement.
+
+    A data change adds version N+1 on AWS and leaves the template's id alone.
+    The create instead minted a new lt- id, threw the Versions list away and
+    reset LatestVersionNumber and DefaultVersionNumber to 1, which is exactly
+    what an Auto Scaling group reads through Fn::GetAtt LatestVersionNumber.
+
+    Measured on AWS 2026-09-21, one property per update: a LaunchTemplateData,
+    a TagSpecifications and a VersionDescription change each add a version
+    (latest 2, 3, 4), the default version stays 1 throughout, and a
+    TagSpecifications change leaves the template's own tags as they were;
+    they are applied at creation only."""
+    import time as _time
+    template = _ec2._launch_templates.get(physical_id)
+    name = new_props.get("LaunchTemplateName", _physical_name(
+        stack_name, logical_id or physical_id))
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, template["LaunchTemplateName"] if template else None,
+        _ec2_launch_template_create, _ec2_launch_template_delete,
+    )
+    if replaced is not None:
+        return replaced
+    version_number = int(template.get("LatestVersionNumber", 1)) + 1
+    template.setdefault("Versions", []).append({
+        "LaunchTemplateId": physical_id,
+        "LaunchTemplateName": template["LaunchTemplateName"],
+        "VersionNumber": version_number,
+        "VersionDescription": new_props.get("VersionDescription", ""),
+        "DefaultVersion": False,
+        "CreateTime": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "LaunchTemplateData": new_props.get("LaunchTemplateData", {}),
+    })
+    template["LatestVersionNumber"] = version_number
+    return physical_id, {
+        "LaunchTemplateId": physical_id,
+        "LaunchTemplateName": template["LaunchTemplateName"],
+        "DefaultVersionNumber": str(template.get("DefaultVersionNumber", 1)),
+        "LatestVersionNumber": str(version_number),
+    }
+
+
 def _ec2_launch_template_delete(physical_id, props):
     _ec2._launch_templates.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 # --- ELBv2 (Load Balancer + Listener) provisioners ---
@@ -11658,7 +11719,12 @@ _RESOURCE_HANDLERS = {
     "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
     "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
     "AWS::ECS::Service": {"create": _ecs_service_create, "delete": _ecs_service_delete},
-    "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
+    "AWS::EC2::LaunchTemplate": {
+        "create": _ec2_launch_template_create,
+        "update": _ec2_launch_template_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_launch_template_delete,
+    },
     "AWS::ElasticLoadBalancingV2::LoadBalancer": {
         "create": _elbv2_load_balancer_create,
         "update": _elbv2_load_balancer_update,

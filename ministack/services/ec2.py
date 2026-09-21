@@ -6699,7 +6699,7 @@ def _create_launch_template(p):
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
         <defaultVersionNumber>1</defaultVersionNumber>
         <latestVersionNumber>1</latestVersionNumber>
-        <tags>{tags_xml}</tags>
+        <tagSet>{tags_xml}</tagSet>
     </launchTemplate>""")
 
 
@@ -6774,7 +6774,7 @@ def _describe_launch_templates(p):
             <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
             <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
             <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
-            <tags>{tags_xml}</tags>
+            <tagSet>{tags_xml}</tagSet>
         </item>"""
     return _xml(200, "DescribeLaunchTemplatesResponse",
                 f"<launchTemplates>{items}</launchTemplates>")
@@ -6796,7 +6796,8 @@ def _describe_launch_template_versions(p):
                       "The specified launch template does not exist", 400)
     # Filter by version numbers
     req_versions = _parse_member_list(p, "LaunchTemplateVersion")
-    versions = lt["Versions"]
+    # Newest first, as AWS lists them (measured 2026-09-21).
+    versions = sorted(lt["Versions"], key=lambda v: v["VersionNumber"], reverse=True)
     if req_versions:
         filtered = []
         for rv in req_versions:

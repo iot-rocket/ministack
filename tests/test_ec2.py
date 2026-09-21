@@ -2632,6 +2632,48 @@ def test_ec2_launch_template_crud(ec2):
     assert len(desc3["LaunchTemplates"]) == 0
 
 
+def test_ec2_launch_template_versions_newest_first(ec2):
+    """DescribeLaunchTemplateVersions lists a template's versions newest
+    first on AWS (measured 2026-09-21: 4, 3, 2, 1 after three new versions);
+    the emulator answered them oldest first."""
+    name = f"qa-lt-order-{_uuid_mod.uuid4().hex[:8]}"
+    lt_id = ec2.create_launch_template(
+        LaunchTemplateName=name, LaunchTemplateData={"InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        for instance_type in ("t3.small", "t3.medium"):
+            ec2.create_launch_template_version(
+                LaunchTemplateId=lt_id, LaunchTemplateData={"InstanceType": instance_type})
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=lt_id)["LaunchTemplateVersions"]
+        assert [v["VersionNumber"] for v in versions] == [3, 2, 1]
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_ec2_launch_template_tags_read_back(ec2):
+    """A launch template's tags are the TagSpecifications entry for
+    "launch-template". CreateLaunchTemplate and DescribeLaunchTemplates
+    rendered them under <tags>, where the EC2 model reads <tagSet>, so botocore
+    dropped them and no launch template ever read back a tag."""
+    name = f"qa-lt-tags-{_uuid_mod.uuid4().hex[:8]}"
+    resp = ec2.create_launch_template(
+        LaunchTemplateName=name,
+        LaunchTemplateData={"InstanceType": "t3.micro", "ImageId": "ami-12345678"},
+        TagSpecifications=[{"ResourceType": "launch-template",
+                            "Tags": [{"Key": "team", "Value": "qa"}]}],
+    )
+    lt_id = resp["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        assert resp["LaunchTemplate"]["Tags"] == [{"Key": "team", "Value": "qa"}]
+        ec2.create_tags(Resources=[lt_id], Tags=[{"Key": "added", "Value": "later"}])
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert sorted((t["Key"], t["Value"]) for t in described["Tags"]) == [
+            ("added", "later"), ("team", "qa")]
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
 def test_ec2_launch_template_duplicate_name(ec2):
     """Creating a template with a duplicate name should fail."""
     ec2.create_launch_template(

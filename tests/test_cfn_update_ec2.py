@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError
 from test_cfn import (
     _FAILING_RESOURCE,
     _cfn_output,
+    _cfn_with_failing_resource,
     _delete_cfn_test_stack,
     _output,
     _template_tags,
@@ -715,6 +716,7 @@ def test_cfn_ec2_launch_template_update_adds_a_version(cfn, ec2):
             "Outputs": {
                 "LtId": {"Value": {"Ref": "LT"}},
                 "Latest": {"Value": {"Fn::GetAtt": ["LT", "LatestVersionNumber"]}},
+                "Default": {"Value": {"Fn::GetAtt": ["LT", "DefaultVersionNumber"]}},
             },
         })
 
@@ -740,6 +742,108 @@ def test_cfn_ec2_launch_template_update_adds_a_version(cfn, ec2):
         assert sorted(v["VersionNumber"] for v in versions) == [1, 2]
         latest = next(v for v in versions if v["VersionNumber"] == 2)
         assert latest["LaunchTemplateData"]["InstanceType"] == "t3.large"
+        # The default version stays where it was: measured on AWS 2026-09-21,
+        # a data change answers latest 2 and default 1.
+        assert after["Default"] == "1"
+        assert latest["DefaultVersion"] is False
+        described = ec2.describe_launch_templates(
+            LaunchTemplateIds=[before["LtId"]])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (2, 1)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_launch_template_tags_come_from_tag_specifications(cfn, ec2):
+    """AWS::EC2::LaunchTemplate has no Tags property: the template's own tags
+    are the TagSpecifications entry for "launch-template", which the create
+    ignored. Measured on AWS 2026-09-21: they are applied at creation only, so
+    a TagSpecifications change adds a version and leaves the template's tags,
+    and a tag added through CreateTags, as they were."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lt-tags-{suffix}"
+
+    def template(value):
+        return json.dumps({
+            "Resources": {"LT": {"Type": "AWS::EC2::LaunchTemplate", "Properties": {
+                "LaunchTemplateData": {"ImageId": "ami-cfn7777", "InstanceType": "t3.micro"},
+                "TagSpecifications": [
+                    {"ResourceType": "launch-template",
+                     "Tags": [{"Key": "v", "Value": value}]},
+                    {"ResourceType": "instance",
+                     "Tags": [{"Key": "launched", "Value": "yes"}]},
+                ]}}},
+            "Outputs": {"LtId": {"Value": {"Ref": "LT"}}},
+        })
+
+    def tags(lt_id):
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        return sorted((t["Key"], t["Value"]) for t in described.get("Tags", []))
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("one"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        lt_id = _cfn_output(cfn, stack_name, "LtId")
+        assert tags(lt_id) == [("v", "one")]
+        ec2.create_tags(Resources=[lt_id], Tags=[{"Key": "api", "Value": "kept"}])
+        assert tags(lt_id) == [("api", "kept"), ("v", "one")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "LtId") == lt_id
+        assert tags(lt_id) == [("api", "kept"), ("v", "one")]
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (2, 1)
+
+        # The stack delete takes the template's tags with it.
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [lt_id]}])["Tags"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_launch_template_data_change_is_rolled_back(cfn, ec2):
+    """A LaunchTemplateData change adds a version, so a later failure in the
+    same update rolls it back the way AWS does (measured 2026-09-21): by
+    adding one more version with the old data. The template keeps its id,
+    the latest version is 3 (t3.micro, t3.large, t3.micro), the default stays
+    1, and the stack's GetAtt outputs read what they read before the update."""
+    stack_name = f"cfn-lt-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(instance_type):
+        return json.dumps({
+            "Resources": {"Lt": {"Type": "AWS::EC2::LaunchTemplate", "Properties": {
+                "LaunchTemplateData": {"ImageId": "ami-cfn7777",
+                                       "InstanceType": instance_type}}}},
+            "Outputs": {
+                "LtId": {"Value": {"Ref": "Lt"}},
+                "Latest": {"Value": {"Fn::GetAtt": ["Lt", "LatestVersionNumber"]}},
+                "Default": {"Value": {"Fn::GetAtt": ["Lt", "DefaultVersionNumber"]}},
+            },
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("t3.micro"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        lt_id = _cfn_output(cfn, stack_name, "LtId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("t3.large"), "Lt"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "LtId") == lt_id
+        assert (_cfn_output(cfn, stack_name, "Latest"),
+                _cfn_output(cfn, stack_name, "Default")) == ("1", "1")
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (3, 1)
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=lt_id)["LaunchTemplateVersions"]
+        assert sorted((v["VersionNumber"], v["LaunchTemplateData"]["InstanceType"],
+                       v["DefaultVersion"]) for v in versions) == [
+            (1, "t3.micro", True), (2, "t3.large", False), (3, "t3.micro", False)]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
