@@ -980,6 +980,91 @@ def test_cfn_ec2_route_table_tag_update_keeps_id_and_routes(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ec2_route_table_tag_change_is_rolled_back(cfn, ec2):
+    """A tag change on a route table is applied in place, so a later failure
+    in the same update has to set it back. Measured on AWS 2026-09-21: the
+    table reads stage=before again after UPDATE_ROLLBACK_COMPLETE, under the
+    same id."""
+    stack_name = f"cfn-rtb-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "Tags": [{"Key": "stage", "Value": stage}]}},
+            },
+            "Outputs": {"RtbId": {"Value": {"Ref": "Rtb"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        rtb_id = _cfn_output(cfn, stack_name, "RtbId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("after"), "Rtb"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "RtbId") == rtb_id
+        table = ec2.describe_route_tables(RouteTableIds=[rtb_id])["RouteTables"][0]
+        assert _template_tags(table.get("Tags", [])) == [{"Key": "stage", "Value": "before"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_network_tag_change_keeps_tags_added_through_the_api(cfn, ec2):
+    """The subnet, security group, internet gateway and route table apply a
+    template tag change the way the VPC does: the template's tags take their
+    new values and a tag added through CreateTags survives, as on AWS
+    (measured 2026-09-21 on a VPC). The updates overwrote the whole tag
+    list."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-net-tags-{suffix}"
+
+    def template(value):
+        tags = [{"Key": "a", "Value": value}]
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.51.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.51.1.0/24", "Tags": tags}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                    "GroupDescription": "probe", "VpcId": {"Ref": "Vpc"}, "Tags": tags}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway", "Properties": {"Tags": tags}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "Tags": tags}},
+            },
+            "Outputs": {
+                "Subnet": {"Value": {"Ref": "Subnet"}},
+                "Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}},
+                "Igw": {"Value": {"Ref": "Igw"}},
+                "Rtb": {"Value": {"Ref": "Rtb"}},
+            },
+        })
+
+    def tags_of(resource_id):
+        found = ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [resource_id]}])["Tags"]
+        return sorted((t["Key"], t["Value"]) for t in found if not t["Key"].startswith("aws:"))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ids = {key: _cfn_output(cfn, stack_name, key) for key in ("Subnet", "Sg", "Igw", "Rtb")}
+        ec2.create_tags(Resources=list(ids.values()), Tags=[{"Key": "api", "Value": "kept"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        for key, resource_id in ids.items():
+            assert _cfn_output(cfn, stack_name, key) == resource_id, key
+            assert tags_of(resource_id) == [("a", "2"), ("api", "kept")], key
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_route_target_change_does_not_duplicate(cfn, ec2):
     """The physical id of AWS::EC2::Route is "{table}|{destination}", so a
     changed target leaves it unmoved and the engine declares no replacement.

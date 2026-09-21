@@ -7476,11 +7476,43 @@ def _ec2_rtb_create(logical_id, props, stack_name):
         ],
         "Associations": [],
     }
+    _ec2_apply_tags(rtb_id, props)
     return rtb_id, {"RouteTableId": rtb_id}
+
+
+def _ec2_rtb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a route table in place. Tags is No interruption and VpcId is
+    Replacement on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-routetable.html).
+
+    The create mints a new rtb- id and rebuilds the record with Routes back to
+    the local route and Associations empty, so a tag change destroyed every
+    route and association added through CreateRoute or AssociateRouteTable."""
+    table = _ec2._route_tables.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("VpcId", _ec2._DEFAULT_VPC_ID),
+        table["VpcId"] if table else None,
+        _ec2_rtb_create, _ec2_rtb_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _ec2_apply_tags(physical_id, new_props, old_props)
+    return physical_id, {"RouteTableId": physical_id}
 
 
 def _ec2_rtb_delete(physical_id, props):
     _ec2._route_tables.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
+
+
+# The route target properties, every one of them No interruption on the
+# resource reference, in the order CreateRoute resolves them.
+_EC2_ROUTE_TARGETS = (
+    "GatewayId", "NatGatewayId", "InstanceId", "NetworkInterfaceId",
+    "TransitGatewayId", "VpcPeeringConnectionId", "EgressOnlyInternetGatewayId",
+    "CarrierGatewayId", "LocalGatewayId", "VpcEndpointId", "CoreNetworkArn",
+)
 
 
 def _ec2_route_create(logical_id, props, stack_name):
@@ -11734,7 +11766,12 @@ _RESOURCE_HANDLERS = {
         "delete": _ec2_igw_delete,
     },
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
-    "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
+    "AWS::EC2::RouteTable": {
+        "create": _ec2_rtb_create,
+        "update": _ec2_rtb_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_rtb_delete,
+    },
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
     "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
