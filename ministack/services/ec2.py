@@ -4391,21 +4391,37 @@ def _igw_xml(igw):
     return _igw_fields_xml(igw, tag="item")
 
 
+# A route record's members as DescribeRouteTables names them. A gateway
+# endpoint target is answered as gatewayId, as on AWS.
+_ROUTE_MEMBERS = (
+    ("DestinationIpv6CidrBlock", "destinationIpv6CidrBlock"),
+    ("DestinationPrefixListId", "destinationPrefixListId"),
+    ("GatewayId", "gatewayId"),
+    ("VpcEndpointId", "gatewayId"),
+    ("NatGatewayId", "natGatewayId"),
+    ("InstanceId", "instanceId"),
+    ("VpcPeeringConnectionId", "vpcPeeringConnectionId"),
+    ("TransitGatewayId", "transitGatewayId"),
+    ("NetworkInterfaceId", "networkInterfaceId"),
+    ("EgressOnlyInternetGatewayId", "egressOnlyInternetGatewayId"),
+    ("CarrierGatewayId", "carrierGatewayId"),
+    ("LocalGatewayId", "localGatewayId"),
+    ("CoreNetworkArn", "coreNetworkArn"),
+    ("OdbNetworkArn", "odbNetworkArn"),
+)
+
+
 def _rtb_fields_xml(rtb, tag="item"):
     def _route_xml(r):
-        target = ""
-        if r.get("GatewayId"):
-            target = f"<gatewayId>{r['GatewayId']}</gatewayId>"
-        if r.get("NatGatewayId"):
-            target += f"<natGatewayId>{r['NatGatewayId']}</natGatewayId>"
-        if r.get("InstanceId"):
-            target += f"<instanceId>{r['InstanceId']}</instanceId>"
-        if r.get("VpcPeeringConnectionId"):
-            target += f"<vpcPeeringConnectionId>{r['VpcPeeringConnectionId']}</vpcPeeringConnectionId>"
-        if r.get("TransitGatewayId"):
-            target += f"<transitGatewayId>{r['TransitGatewayId']}</transitGatewayId>"
+        # Every target and destination member a route can carry; an IPv6 or
+        # prefix-list route has no destinationCidrBlock, and one rendered
+        # empty read back as a route to "".
+        target = "".join(
+            f"<{element}>{_esc(r[key])}</{element}>"
+            for key, element in _ROUTE_MEMBERS if r.get(key))
+        if not any(r.get(key) for key in ("DestinationIpv6CidrBlock", "DestinationPrefixListId")):
+            target = f"<destinationCidrBlock>{r.get('DestinationCidrBlock', '')}</destinationCidrBlock>" + target
         return f"""<item>
-        <destinationCidrBlock>{r.get('DestinationCidrBlock','')}</destinationCidrBlock>
         {target}
         <state>{r.get('State','active')}</state>
         <origin>{r.get('Origin','')}</origin>

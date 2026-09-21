@@ -1117,3 +1117,60 @@ def test_cfn_ec2_route_target_change_does_not_duplicate(cfn, ec2):
         assert default[0].get("GatewayId") == "igw-bbbbbbbb"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_route_destinations_are_separate_routes(cfn, ec2):
+    """DestinationCidrBlock, DestinationIpv6CidrBlock and
+    DestinationPrefixListId are three create-only properties of
+    AWS::EC2::Route, each naming its own route: on AWS a prefix-list route
+    and an IPv6 default route sit beside the IPv4 default route, and removing
+    one leaves the others (measured 2026-09-21). The provisioner read only
+    DestinationCidrBlock and defaulted it to 0.0.0.0/0, so a prefix-list or
+    IPv6 route took the IPv4 default route's place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-route-dest-{suffix}"
+    prefix_list = ec2.create_managed_prefix_list(
+        PrefixListName=f"cfn-route-dest-{suffix}", MaxEntries=1, AddressFamily="IPv4",
+        Entries=[{"Cidr": "198.51.100.0/24"}])["PrefixList"]["PrefixListId"]
+
+    def template(with_v4):
+        routes = {
+            "RoutePl": {"DestinationPrefixListId": prefix_list},
+            "Route6": {"DestinationIpv6CidrBlock": "::/0"},
+        }
+        if with_v4:
+            routes["Route4"] = {"DestinationCidrBlock": "0.0.0.0/0"}
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.59.0.0/16"}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {"VpcId": {"Ref": "Vpc"}}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway"},
+                "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "InternetGatewayId": {"Ref": "Igw"}}},
+                **{logical_id: {"Type": "AWS::EC2::Route", "DependsOn": "Attach", "Properties": {
+                    "RouteTableId": {"Ref": "Rtb"}, "GatewayId": {"Ref": "Igw"}, **destination}}
+                   for logical_id, destination in routes.items()},
+            },
+            "Outputs": {"Rtb": {"Value": {"Ref": "Rtb"}}, "RoutePl": {"Value": {"Ref": "RoutePl"}}},
+        })
+
+    def destinations(rtb):
+        table = ec2.describe_route_tables(RouteTableIds=[rtb])["RouteTables"][0]
+        return sorted(
+            r.get("DestinationCidrBlock") or r.get("DestinationIpv6CidrBlock")
+            or r.get("DestinationPrefixListId") for r in table["Routes"])
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rtb = _cfn_output(cfn, stack_name, "Rtb")
+        assert _cfn_output(cfn, stack_name, "RoutePl") == f"{rtb}|{prefix_list}"
+        assert destinations(rtb) == sorted(["0.0.0.0/0", "10.59.0.0/16", "::/0", prefix_list])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert destinations(rtb) == sorted(["10.59.0.0/16", "::/0", prefix_list])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ec2.delete_managed_prefix_list(PrefixListId=prefix_list)

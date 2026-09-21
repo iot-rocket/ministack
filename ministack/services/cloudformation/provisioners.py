@@ -7512,21 +7512,80 @@ _EC2_ROUTE_TARGETS = (
     "GatewayId", "NatGatewayId", "InstanceId", "NetworkInterfaceId",
     "TransitGatewayId", "VpcPeeringConnectionId", "EgressOnlyInternetGatewayId",
     "CarrierGatewayId", "LocalGatewayId", "VpcEndpointId", "CoreNetworkArn",
+    "OdbNetworkArn",
 )
+# The three destination properties, each create-only and each naming its own
+# route: a table holds an IPv4, an IPv6 and a prefix-list route side by side
+# (measured 2026-09-21), so the destination has to be read from the property
+# the template set, not defaulted to 0.0.0.0/0.
+_EC2_ROUTE_DESTINATIONS = (
+    "DestinationCidrBlock", "DestinationIpv6CidrBlock", "DestinationPrefixListId",
+)
+
+
+def _ec2_route_destination(props):
+    """(destination property, value) of a route's properties."""
+    for prop in _EC2_ROUTE_DESTINATIONS:
+        if props.get(prop):
+            return prop, props[prop]
+    return "DestinationCidrBlock", "0.0.0.0/0"
+
+
+def _ec2_route_record(props, dest):
+    prop, value = dest
+    route = {prop: value, "State": "active", "Origin": "CreateRoute"}
+    for target in _EC2_ROUTE_TARGETS:
+        if props.get(target):
+            route[target] = props[target]
+            break
+    return route
+
+
+def _ec2_route_put(rtb, props, dest):
+    """Put the route for ``dest`` into the table, replacing the one already
+    holding that destination rather than appending beside it."""
+    prop, value = dest
+    rtb["Routes"] = [
+        r for r in rtb["Routes"] if r.get(prop) != value
+    ] + [_ec2_route_record(props, dest)]
 
 
 def _ec2_route_create(logical_id, props, stack_name):
     rtb_id = props.get("RouteTableId", "")
-    dest = props.get("DestinationCidrBlock", "0.0.0.0/0")
+    dest = _ec2_route_destination(props)
     rtb = _ec2._route_tables.get(rtb_id)
     if rtb:
-        route = {"DestinationCidrBlock": dest, "State": "active", "Origin": "CreateRoute"}
-        if props.get("GatewayId"):
-            route["GatewayId"] = props["GatewayId"]
-        elif props.get("NatGatewayId"):
-            route["NatGatewayId"] = props["NatGatewayId"]
-        rtb["Routes"].append(route)
-    physical_id = f"{rtb_id}|{dest}"
+        # Put, not append: a route the table already holds for this
+        # destination is replaced rather than duplicated.
+        _ec2_route_put(rtb, props, dest)
+    physical_id = f"{rtb_id}|{dest[1]}"
+    return physical_id, {}
+
+
+def _ec2_route_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a route in place. Every target property is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route.html),
+    which is what ReplaceRoute does; RouteTableId and the three destination
+    properties are Replacement, and all four are already carried by the
+    physical id "{table}|{destination}".
+
+    That deterministic id is what made this the one type in the family to
+    corrupt state rather than replace it: a changed target left the id
+    unmoved, so the engine declared no replacement and ran no predecessor
+    delete, while the create appended a second entry. The table then held two
+    routes for one destination, both rendered by DescribeRouteTables."""
+    rtb_id, _, dest_value = physical_id.partition("|")
+    dest = _ec2_route_destination(new_props)
+    if (new_props.get("RouteTableId", "") != rtb_id or dest[1] != dest_value
+            or dest != _ec2_route_destination(old_props)):
+        created = _ec2_route_create(logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_ec2_route_delete, physical_id, old_props)
+        return created
+    rtb = _ec2._route_tables.get(rtb_id)
+    if rtb is None:
+        return _ec2_route_create(logical_id or physical_id, new_props, stack_name)
+    _ec2_route_put(rtb, new_props, dest)
     return physical_id, {}
 
 
@@ -7535,7 +7594,8 @@ def _ec2_route_delete(physical_id, props):
     if len(parts) == 2:
         rtb = _ec2._route_tables.get(parts[0])
         if rtb:
-            rtb["Routes"] = [r for r in rtb["Routes"] if r.get("DestinationCidrBlock") != parts[1]]
+            rtb["Routes"] = [r for r in rtb["Routes"]
+                             if all(r.get(p) != parts[1] for p in _EC2_ROUTE_DESTINATIONS)]
 
 
 def _ec2_subnet_rtb_assoc_create(logical_id, props, stack_name):
@@ -11772,7 +11832,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ec2_rtb_delete,
     },
-    "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
+    "AWS::EC2::Route": {
+        "create": _ec2_route_create,
+        "update": _ec2_route_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_route_delete,
+    },
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
     "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
     "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
