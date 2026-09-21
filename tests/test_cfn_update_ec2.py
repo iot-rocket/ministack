@@ -896,6 +896,43 @@ def test_cfn_ec2_internet_gateway_tag_update_keeps_id_and_attachment(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ec2_internet_gateway_tag_change_is_rolled_back(cfn, ec2):
+    """A tag change on an internet gateway is applied in place, so a later
+    failure in the same update has to set it back. Measured on AWS
+    2026-09-21: the gateway reads stage=before again after
+    UPDATE_ROLLBACK_COMPLETE, under the same id and still attached."""
+    stack_name = f"cfn-igw-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.52.0.0/16"}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway",
+                        "Properties": {"Tags": [{"Key": "stage", "Value": stage}]}},
+                "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "InternetGatewayId": {"Ref": "Igw"}}},
+            },
+            "Outputs": {"IgwId": {"Value": {"Ref": "Igw"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        igw_id = _cfn_output(cfn, stack_name, "IgwId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("after"), "Igw"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "IgwId") == igw_id
+        described = ec2.describe_internet_gateways(
+            InternetGatewayIds=[igw_id])["InternetGateways"][0]
+        assert described["Attachments"], "the VPC attachment was dropped"
+        assert _template_tags(described.get("Tags", [])) == [{"Key": "stage", "Value": "before"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_route_table_tag_update_keeps_id_and_routes(cfn, ec2):
     """Tags is the only property AWS::EC2::RouteTable has. The create minted a
     new rtb- id and reset Routes to the local route and Associations to empty,

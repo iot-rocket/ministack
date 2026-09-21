@@ -7411,19 +7411,35 @@ def _ec2_sg_delete(physical_id, props):
 
 
 def _ec2_igw_create(logical_id, props, stack_name):
-    import random
-    import string
-    igw_id = "igw-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    igw_id = _ec2._new_igw_id()
     _ec2._internet_gateways[igw_id] = {
         "InternetGatewayId": igw_id,
         "OwnerId": get_account_id(),
         "Attachments": [],
     }
+    _ec2_apply_tags(igw_id, props)
     return igw_id, {"InternetGatewayId": igw_id}
+
+
+def _ec2_igw_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an internet gateway in place. Tags is the only property
+    AWS::EC2::InternetGateway has and it is No interruption
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-internetgateway.html),
+    so nothing about this type can ever require a replacement.
+
+    The create ignored props entirely, so the one change a template can make
+    to a gateway minted a new igw- id, reset Attachments to empty and still
+    applied no tags."""
+    gateway = _ec2._internet_gateways.get(physical_id)
+    if gateway is None:
+        return _ec2_igw_create(logical_id or physical_id, new_props, stack_name)
+    _ec2_apply_tags(physical_id, new_props, old_props)
+    return physical_id, {"InternetGatewayId": physical_id}
 
 
 def _ec2_igw_delete(physical_id, props):
     _ec2._internet_gateways.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
@@ -11711,7 +11727,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ec2_sg_delete,
     },
-    "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
+    "AWS::EC2::InternetGateway": {
+        "create": _ec2_igw_create,
+        "update": _ec2_igw_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_igw_delete,
+    },
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
