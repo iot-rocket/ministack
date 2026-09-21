@@ -17180,6 +17180,12 @@ def test_cfn_appsync_schema_stack_delete_removes_schema(cfn, appsync):
             pass
 
 
+def _cfn_output(cfn, stack_name, key):
+    return next(o["OutputValue"]
+                for o in cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                if o["OutputKey"] == key)
+
+
 # ===========================================================================
 # In-place update handlers — deploy, update a mutable property, assert the
 # physical id survived and the new value is visible through the service API

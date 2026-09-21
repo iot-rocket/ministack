@@ -2657,6 +2657,15 @@ def _ssm_delete(physical_id, props):
 
 # --- AppConfig Application ---
 
+def _appconfig_reconcile_tags(arn, old_props, new_props):
+    """AppConfig keeps tags in a per-ARN map beside the record rather than on
+    it, so the shared reconcile runs against that map. Tags set through
+    TagResource stay, as they do on AWS."""
+    if not old_props.get("Tags") and not new_props.get("Tags"):
+        return
+    _reconcile_tag_map(_appconfig._tags.setdefault(arn, {}), old_props, new_props)
+
+
 def _appconfig_application_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id)
     app_id = _appconfig._gen_id()
@@ -2672,6 +2681,27 @@ def _appconfig_application_create(logical_id, props, stack_name):
             {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
         )
     return app_id, {"ApplicationId": app_id}
+
+
+def _appconfig_application_update(physical_id, old_props, new_props, stack_name,
+                                  logical_id=None):
+    """Update an application in place. Description, Name and Tags are each
+    No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-application.html),
+    and the type declares no replacing property at all: Ref answers the
+    generated application id, which no update changes. Without this the
+    create-fallback minted a second application and orphaned the first,
+    taking its environments and configuration profiles with it (they are
+    keyed by the old id)."""
+    app = _appconfig._applications.get(physical_id)
+    if app is None:
+        return _appconfig_application_create(
+            logical_id or physical_id, new_props, stack_name)
+    if new_props.get("Name"):
+        app["Name"] = new_props["Name"]
+    app["Description"] = new_props.get("Description", "")
+    _appconfig_reconcile_tags(_appconfig._app_arn(physical_id), old_props, new_props)
+    return physical_id, {"ApplicationId": physical_id}
 
 
 def _appconfig_application_delete(physical_id, props):
@@ -2704,6 +2734,39 @@ def _appconfig_environment_create(logical_id, props, stack_name):
         )
     # Ref → environment ID; GetAtt EnvironmentId per AWS CFN reference.
     return env_id, {"EnvironmentId": env_id}
+
+
+def _appconfig_environment_update(physical_id, old_props, new_props, stack_name,
+                                  logical_id=None):
+    """Update an environment in place. DeletionProtectionCheck, Description,
+    Monitors, Name and Tags are No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-environment.html);
+    ApplicationId is Replacement, and the environment moves to the other
+    application under a freshly generated id. State belongs to the service,
+    not the template, so a replacement re-reads it and an in-place update
+    leaves it alone."""
+    app_id = new_props.get("ApplicationId", "")
+    # Keyed by the OLD application id: under a changed ApplicationId the new
+    # key holds nothing, and _rename_replacement would then read the record as
+    # gone and create the replacement without deleting the predecessor.
+    env = _appconfig._environments.get(
+        f"{old_props.get('ApplicationId', '')}/{physical_id}")
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        app_id, env["ApplicationId"] if env else None,
+        _appconfig_environment_create, _appconfig_environment_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if new_props.get("Name"):
+        env["Name"] = new_props["Name"]
+    env["Description"] = new_props.get("Description", "")
+    env["Monitors"] = new_props.get("Monitors", [])
+    env["DeletionProtectionCheck"] = new_props.get(
+        "DeletionProtectionCheck", "ACCOUNT_DEFAULT")
+    _appconfig_reconcile_tags(
+        _appconfig._env_arn(app_id, physical_id), old_props, new_props)
+    return physical_id, {"EnvironmentId": physical_id}
 
 
 def _appconfig_environment_delete(physical_id, props):
@@ -2744,6 +2807,48 @@ def _appconfig_configuration_profile_create(logical_id, props, stack_name):
     return profile_id, {
         "ConfigurationProfileId": profile_id,
         "KmsKeyArn": props.get("KmsKeyIdentifier", ""),
+    }
+
+
+def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
+                                            stack_name, logical_id=None):
+    """Update a configuration profile in place. DeletionProtectionCheck,
+    Description, KmsKeyIdentifier, Name, RetrievalRoleArn, Tags and Validators
+    are No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-configurationprofile.html);
+    ApplicationId, LocationUri and Type are Replacement, so the three are read
+    as one key. The create-fallback re-created the profile under a new id and
+    left every hosted configuration version behind it (they are keyed by
+    application and profile id)."""
+    app_id = new_props.get("ApplicationId", "")
+    # The old key, for the same reason the environment handler uses it.
+    profile = _appconfig._config_profiles.get(
+        f"{old_props.get('ApplicationId', '')}/{physical_id}")
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (app_id,
+         new_props.get("LocationUri", "hosted"),
+         new_props.get("Type", "AWS.Freeform")),
+        (profile["ApplicationId"], profile["LocationUri"], profile["Type"])
+        if profile else None,
+        _appconfig_configuration_profile_create,
+        _appconfig_configuration_profile_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if new_props.get("Name"):
+        profile["Name"] = new_props["Name"]
+    profile["Description"] = new_props.get("Description", "")
+    profile["RetrievalRoleArn"] = new_props.get("RetrievalRoleArn", "")
+    profile["Validators"] = new_props.get("Validators", [])
+    profile["KmsKeyIdentifier"] = new_props.get("KmsKeyIdentifier", "")
+    profile["DeletionProtectionCheck"] = new_props.get(
+        "DeletionProtectionCheck", "ACCOUNT_DEFAULT")
+    _appconfig_reconcile_tags(
+        _appconfig._profile_arn(app_id, physical_id), old_props, new_props)
+    return physical_id, {
+        "ConfigurationProfileId": physical_id,
+        "KmsKeyArn": new_props.get("KmsKeyIdentifier", ""),
     }
 
 
@@ -2825,6 +2930,38 @@ def _appconfig_deployment_strategy_create(logical_id, props, stack_name):
         )
     # Ref → deployment strategy ID; GetAtt is `Id` (singular) per AWS reference.
     return strategy_id, {"Id": strategy_id}
+
+
+def _appconfig_deployment_strategy_update(physical_id, old_props, new_props,
+                                          stack_name, logical_id=None):
+    """Update a deployment strategy in place. DeploymentDurationInMinutes,
+    Description, FinalBakeTimeInMinutes, GrowthFactor, GrowthType and Tags are
+    No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-deploymentstrategy.html);
+    Name and ReplicateTo are Replacement, and both are read as one key. The
+    name is not the physical id here (Ref answers the generated strategy id),
+    so a rename is a plain replacement with nothing to refuse."""
+    strategy = _appconfig._deployment_strategies.get(physical_id)
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=64)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (name, new_props.get("ReplicateTo", "NONE")),
+        (strategy["Name"], strategy["ReplicateTo"]) if strategy else None,
+        _appconfig_deployment_strategy_create,
+        _appconfig_deployment_strategy_delete,
+    )
+    if replaced is not None:
+        return replaced
+    strategy["Description"] = new_props.get("Description", "")
+    strategy["DeploymentDurationInMinutes"] = new_props.get(
+        "DeploymentDurationInMinutes", 0)
+    strategy["GrowthType"] = new_props.get("GrowthType", "LINEAR")
+    strategy["GrowthFactor"] = new_props.get("GrowthFactor", 100.0)
+    strategy["FinalBakeTimeInMinutes"] = new_props.get("FinalBakeTimeInMinutes", 0)
+    _appconfig_reconcile_tags(
+        _appconfig._strategy_arn(physical_id), old_props, new_props)
+    return physical_id, {"Id": physical_id}
 
 
 def _appconfig_deployment_strategy_delete(physical_id, props):
@@ -10614,14 +10751,20 @@ _RESOURCE_HANDLERS = {
     "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
+        "update": _appconfig_application_update,
+        "update_with_logical_id": True,
         "delete": _appconfig_application_delete,
     },
     "AWS::AppConfig::Environment": {
         "create": _appconfig_environment_create,
+        "update": _appconfig_environment_update,
+        "update_with_logical_id": True,
         "delete": _appconfig_environment_delete,
     },
     "AWS::AppConfig::ConfigurationProfile": {
         "create": _appconfig_configuration_profile_create,
+        "update": _appconfig_configuration_profile_update,
+        "update_with_logical_id": True,
         "delete": _appconfig_configuration_profile_delete,
     },
     "AWS::AppConfig::HostedConfigurationVersion": {
@@ -10630,6 +10773,8 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AppConfig::DeploymentStrategy": {
         "create": _appconfig_deployment_strategy_create,
+        "update": _appconfig_deployment_strategy_update,
+        "update_with_logical_id": True,
         "delete": _appconfig_deployment_strategy_delete,
     },
     "AWS::AppConfig::Deployment": {

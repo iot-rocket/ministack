@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **CloudFormation — AppConfig applications, environments, configuration profiles and deployment strategies update in place** — none of the four had an update handler, so any property change re-ran the create and the resource came back under a new id. The environments, configuration profiles and hosted configuration versions keyed by the old id were orphaned. Each type now updates in place what its resource reference lists as No interruption and replaces on the rest. Contributed by @iot-rocket.
+
 ## [1.5.15] — 2026-09-22
 
 ### Added
