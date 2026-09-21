@@ -173,8 +173,9 @@ def test_import_change_set_describes_only_imports_and_is_unavailable(cfn, adopte
     # AWS answers AVAILABLE and executes the import; the emulator refuses it by design.
     assert cs["ExecutionStatus"] == "UNAVAILABLE"
     assert "import" in cs["StatusReason"].lower()
-    assert [(r["ResourceChange"]["LogicalResourceId"], r["ResourceChange"]["Action"],
-             r["ResourceChange"]["ResourceType"]) for r in cs["Changes"]] == [("Q", "Import", "AWS::SQS::Queue")]
+    assert [(r["Type"], r["ResourceChange"]["LogicalResourceId"], r["ResourceChange"]["Action"],
+             r["ResourceChange"]["ResourceType"]) for r in cs["Changes"]] == [
+        ("Resource", "Q", "Import", "AWS::SQS::Queue")]
 
 
 @pytest.mark.parametrize("outside", list(_TYPES), indirect=True)
@@ -187,14 +188,14 @@ def test_import_change_names_the_resource_and_has_no_replacement(cfn, adopted, o
     to_import = _import_of(kind, identifier_value(kind, name))
     cs = _create(cfn, adopted, template, to_import)
     assert cs["Status"] == "CREATE_COMPLETE"
-    assert [c["ResourceChange"] for c in cs["Changes"]] == [{
+    assert cs["Changes"] == [{"Type": "Resource", "ResourceChange": {
         "Action": "Import",
         "LogicalResourceId": "Q",
         "PhysicalResourceId": identifier_value(kind, name),
         "ResourceType": _TYPES[kind][0],
         "Scope": [],
         "Details": [],
-    }]
+    }}]
 
 
 def test_update_change_set_changes_keep_their_shape(cfn, ssm):
@@ -564,9 +565,9 @@ def test_import_into_a_new_stack_creates_it_for_review(cfn, fresh):
     cs = cfn.describe_change_set(ChangeSetName=cs_id)
     # AWS answers AVAILABLE and executes the import; the emulator refuses it by design.
     assert (cs["Status"], cs["ExecutionStatus"]) == ("CREATE_COMPLETE", "UNAVAILABLE")
-    assert [c["ResourceChange"] for c in cs["Changes"]] == [{
+    assert cs["Changes"] == [{"Type": "Resource", "ResourceChange": {
         "Action": "Import", "LogicalResourceId": "Q", "PhysicalResourceId": url,
-        "ResourceType": "AWS::SQS::Queue", "Scope": [], "Details": []}]
+        "ResourceType": "AWS::SQS::Queue", "Scope": [], "Details": []}}]
     assert _stack_row(cfn, stack) == ("REVIEW_IN_PROGRESS", "User Initiated", None)
     assert cfn.describe_stack_resources(StackName=stack)["StackResources"] == []
     events = cfn.describe_stack_events(StackName=stack)["StackEvents"]

@@ -1613,6 +1613,34 @@ def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
         cfn.delete_stack(StackName=S)
 
 
+def test_cfn_change_set_changes_carry_their_type(cfn):
+    """Every entry of a change set's Changes carries Type "Resource", the one
+    ChangeType there is; measured on AWS for Add, Modify, Remove and Import."""
+    S = f"cfn-change-type-{_uuid_mod.uuid4().hex[:8]}"
+
+    def param(suffix, value="v"):
+        return {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/{S}/{suffix}", "Type": "String", "Value": value}}
+
+    cfn.create_change_set(StackName=S, ChangeSetName="create", ChangeSetType="CREATE",
+                          TemplateBody=json.dumps({"Resources": {"X": param("x"), "Y": param("y")}}))
+    try:
+        created = cfn.describe_change_set(ChangeSetName="create", StackName=S)["Changes"]
+        assert [(c.get("Type"), c["ResourceChange"]["Action"]) for c in created] == [
+            ("Resource", "Add"), ("Resource", "Add")]
+        cfn.execute_change_set(ChangeSetName="create", StackName=S)
+        _wait_stack(cfn, S)
+        cfn.create_change_set(StackName=S, ChangeSetName="update", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {
+                                  "X": param("x", "w"), "Z": param("z")}}))
+        updated = cfn.describe_change_set(ChangeSetName="update", StackName=S)["Changes"]
+        assert sorted((c.get("Type"), c["ResourceChange"]["Action"]) for c in updated) == [
+            ("Resource", "Add"), ("Resource", "Modify"), ("Resource", "Remove")]
+    finally:
+        cfn.delete_stack(StackName=S)
+        _wait_stack(cfn, S)
+
+
 def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
     """A change set lists a resource whose DeletionPolicy, UpdateReplacePolicy
     or Metadata changed and nothing else: Modify, Replacement False, the

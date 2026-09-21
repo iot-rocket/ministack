@@ -620,8 +620,9 @@ def _describe_change_set(params):
         replacement_xml = (
             f"<Replacement>{rc['Replacement']}</Replacement>" if "Replacement" in rc else ""
         )
+        # "Resource" is the one ChangeType, and AWS reports it on every change.
         changes_xml += (
-            "<member><ResourceChange>"
+            "<member><Type>Resource</Type><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
             f"{physical_xml}"
