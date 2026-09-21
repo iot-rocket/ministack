@@ -16856,12 +16856,16 @@ def test_cfn_create_rollback_delete_failure_lands_rollback_failed(cfn, lam):
             pass
 
 
-def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, lam):
-    """An update rollback whose delete fails lands UPDATE_ROLLBACK_FAILED and
-    keeps the previous resources on the stack."""
+def test_cfn_update_rollback_cleanup_delete_failure_still_completes(cfn, lam):
+    """What the failed update created is deleted in the cleanup phase, after
+    the rollback is complete (UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS on
+    AWS, measured 2026-09-21). A delete that fails there is a DELETE_FAILED
+    event on the resource and the stack still lands UPDATE_ROLLBACK_COMPLETE
+    with the previous resources; it used to turn the stack into
+    UPDATE_ROLLBACK_FAILED."""
     suffix = _uuid_mod.uuid4().hex[:8]
     fn = f"cr-urb-fail-{suffix}"
-    stack_name = f"cfn-update-rollback-failed-{suffix}"
+    stack_name = f"cfn-update-rollback-cleanup-{suffix}"
     topic_name = f"cfn-urb-topic-{suffix}"
     lam.create_function(
         FunctionName=fn,
@@ -16897,9 +16901,95 @@ def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, la
 
         cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
         stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in retained] == ["Topic"]
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_FAILED"
+                   for e in events)
+        assert not any(e["ResourceType"] == "AWS::CloudFormation::Stack"
+                       and e["ResourceStatus"] == "UPDATE_ROLLBACK_FAILED"
+                       for e in events)
+    finally:
+        try:
+            lam.update_function_code(
+                FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS)
+            )
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+# Refuses the Update that takes Mode back to "before", which is what the
+# rollback of a before -> after update sends; every other request succeeds.
+_CR_HANDLER_REVERT_FAILS = """\
+import json, urllib.request
+
+def handler(event, context):
+    reverting = (event["RequestType"] == "Update"
+                 and event["ResourceProperties"].get("Mode") == "before")
+    payload = json.dumps({
+        "Status": "FAILED" if reverting else "SUCCESS",
+        "Reason": "revert refused for testing",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": event.get("PhysicalResourceId", "revert-fails-cr"),
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def _cr_revert_fails_templates(fn, topic_name):
+    """A stack whose custom resource goes from Mode before to after beside a
+    resource that fails, so the rollback has to send the custom resource back
+    and _CR_HANDLER_REVERT_FAILS refuses that."""
+    def template(mode, with_bad):
+        resources = {
+            "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": topic_name}},
+            "CR": {"Type": "Custom::Tester", "Properties": {
+                "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+                "Mode": mode}},
+        }
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+        return json.dumps({"Resources": resources})
+    return template("before", False), template("after", True)
+
+
+def test_cfn_update_rollback_revert_failure_lands_update_rollback_failed(cfn, lam):
+    """An update rollback that cannot send a resource back to its previous
+    properties lands UPDATE_ROLLBACK_FAILED and keeps the previous resources
+    on the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-urb-revert-{suffix}"
+    stack_name = f"cfn-update-rollback-failed-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_REVERT_FAILS)},
+    )
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-urb-topic-{suffix}")
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
+        stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
 
-        # The pre-update resources survive on the stack.
         retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
         assert "Topic" in [r["LogicalResourceId"] for r in retained]
 
@@ -16956,16 +17046,11 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
     stack_name = f"cfn-continue-rollback-{suffix}"
     lam.create_function(
         FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
-        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_REVERT_FAILS)},
     )
-    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
-                                    "Properties": {"TopicName": f"cfn-cur-{suffix}"}}}}
-    updated = json.loads(json.dumps(base))
-    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
-        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
-    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-cur-{suffix}")
     try:
-        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         with pytest.raises(ClientError) as exc:
@@ -16973,7 +17058,7 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
         assert "cannot be called from current stack status" in (
             exc.value.response["Error"]["Message"])
 
-        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
 
@@ -16985,17 +17070,16 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
             cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["Topic"])
         assert "Topic" in exc.value.response["Error"]["Message"]
 
-        # Once the resource can be deleted, the retry completes the rollback
-        # without skipping anything.
+        # Once the resource can be sent back, the retry completes the
+        # rollback without skipping anything.
         lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
         cfn.continue_update_rollback(StackName=stack_name)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
-        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_COMPLETE"
-                   for e in events)
+        resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert sorted(r["LogicalResourceId"] for r in resources) == ["CR", "Topic"]
 
-        again = json.loads(json.dumps(base))
+        again = json.loads(base)
         again["Resources"]["Topic"]["Properties"]["DisplayName"] = "after"
         cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(again))
         stack = _wait_stack(cfn, stack_name)
@@ -17020,18 +17104,13 @@ def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
     stack_name = f"cfn-continue-skip-{suffix}"
     lam.create_function(
         FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
-        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_REVERT_FAILS)},
     )
-    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
-                                    "Properties": {"TopicName": f"cfn-cur-skip-{suffix}"}}}}
-    updated = json.loads(json.dumps(base))
-    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
-        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
-    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-cur-skip-{suffix}")
     try:
-        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
-        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
 
         cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["CR"])
@@ -17039,6 +17118,7 @@ def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
         events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
         assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "UPDATE_COMPLETE"
+                   and e.get("ResourceStatusReason") == "Resource rollback skipped by user"
                    for e in events)
     finally:
         try:
@@ -21716,13 +21796,13 @@ def test_cfn_iam_instance_profile_path_change_under_generated_name_replaces_it(c
 
 
 def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, ddb):
-    """A failed update rolls back only what the update created. The queue
+    """A failed update deletes only what the update created. The queue
     existed before the update and kept its physical id through an in-place
-    change, so the rollback leaves it alone; the queue the update added is
-    deleted; the table, whose attribute type change is refused under its
-    custom name, is what fails the update. The in-place change itself is not
-    reverted: the queue keeps the new VisibilityTimeout while the stack
-    records the old template."""
+    change, so the rollback does not delete it: it updates it back to the
+    properties the restored stack records, with UPDATE_IN_PROGRESS and
+    UPDATE_COMPLETE events, as AWS does during UPDATE_ROLLBACK_IN_PROGRESS.
+    The queue the update added is deleted; the table, whose attribute type
+    change is refused under its custom name, is what fails the update."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-rb-keep-{uid}"
     queue_name = f"cfn-rb-keep-{uid}"
@@ -21761,13 +21841,27 @@ def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, d
                     and e["ResourceStatus"].startswith("DELETE")]
         assert [e for e in events if e["LogicalResourceId"] == "Added"
                 and e["ResourceStatus"] == "DELETE_COMPLETE"]
+        # The rollback as AWS records it (measured 2026-09-21 on this template):
+        # the queue updated back first, the refused table marked complete, and
+        # only then the added queue deleted in the cleanup phase.
+        rollback = next(i for i, e in enumerate(events)
+                        if e["LogicalResourceId"] == stack_name
+                        and e["ResourceStatus"] == "UPDATE_ROLLBACK_IN_PROGRESS")
+        assert [(e["LogicalResourceId"], e["ResourceStatus"])
+                for e in reversed(events[:rollback])
+                if e["LogicalResourceId"] != stack_name
+                and e["ResourceStatus"] != "DELETE_IN_PROGRESS"] == [
+            ("Queue", "UPDATE_IN_PROGRESS"), ("Queue", "UPDATE_COMPLETE"),
+            ("Table", "UPDATE_COMPLETE"), ("Added", "DELETE_COMPLETE")]
 
         assert sqs.get_queue_url(QueueName=queue_name)["QueueUrl"] == queue_url
         attributes = sqs.get_queue_attributes(
             QueueUrl=queue_url, AttributeNames=["VisibilityTimeout", "ApproximateNumberOfMessages"]
         )["Attributes"]
         assert attributes["ApproximateNumberOfMessages"] == "1"
-        assert attributes["VisibilityTimeout"] == "45"  # the in-place change is not reverted
+        # Back to the value before the update: the rollback reverts an in-place
+        # change instead of leaving the queue at 45 under a stack that records 30.
+        assert attributes["VisibilityTimeout"] == "30"
         with pytest.raises(ClientError):
             sqs.get_queue_url(QueueName=added_name)
         table = ddb.describe_table(TableName=table_name)["Table"]
@@ -21833,9 +21927,10 @@ def test_cfn_update_rollback_deletes_the_replacement_and_keeps_the_old_resource(
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
         for logical_id, new_pid in (("Queue", new_url), ("Param", new_param)):
+            # DELETE_IN_PROGRESS then DELETE_COMPLETE, both for the replacement.
             deleted = [pid for status, pid in _resource_events(cfn, stack_name, logical_id)
                        if status.startswith("DELETE")]
-            assert deleted == [new_pid], (logical_id, deleted)
+            assert deleted == [new_pid, new_pid], (logical_id, deleted)
         assert _queue_exists(sqs, old_name) and not _queue_exists(sqs, new_name)
         assert param_exists(old_param) and not param_exists(new_param)
         resources = {r["LogicalResourceId"]: r["PhysicalResourceId"]
