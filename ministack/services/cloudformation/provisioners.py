@@ -6928,6 +6928,40 @@ def _kms_alias_delete(physical_id, props):
 
 # --- EC2 resource provisioners ---
 
+def _ec2_apply_tags(physical_id, props, old_props=None):
+    """The template's tags in the EC2 tag store, which is what every EC2
+    Describe renders through ``_tag_set_xml``. The networking provisioners
+    never wrote it, so no tag a template declared on a VPC, subnet, security
+    group, gateway or route table was readable at all.
+
+    An update passes ``old_props``: the change is reconciled, so a tag added
+    through CreateTags survives a template tag change, as on AWS (measured
+    2026-09-21 on a VPC)."""
+    tags = list(_ec2._tags.get(physical_id) or [])
+    _reconcile_tag_list(tags, old_props or {}, props)
+    if tags:
+        _ec2._tags[physical_id] = tags
+    else:
+        _ec2._tags.pop(physical_id, None)
+
+
+def _ec2_vpc_dns_attributes(vpc, props, reset_absent=False):
+    """EnableDnsSupport and EnableDnsHostnames on the record, in the shape
+    ModifyVpcAttribute writes and DescribeVpcAttribute reads. The create never
+    read either, so a template that set them was ignored.
+
+    With ``reset_absent`` (an update), a property the template no longer sets
+    goes back to the default DescribeVpcAttribute reads, support on and
+    hostnames off, which is what AWS does (measured 2026-09-21: a removed
+    EnableDnsHostnames reads false, a removed EnableDnsSupport true)."""
+    for prop in ("EnableDnsSupport", "EnableDnsHostnames"):
+        if prop in props:
+            value = props[prop]
+            vpc[prop] = value if isinstance(value, bool) else str(value).lower() == "true"
+        elif reset_absent:
+            vpc.pop(prop, None)
+
+
 def _ec2_vpc_create(logical_id, props, stack_name):
     import random
     import string
@@ -6966,12 +7000,75 @@ def _ec2_vpc_create(logical_id, props, stack_name):
         "OwnerId": get_account_id(), "DefaultNetworkAclId": acl_id,
         "DefaultSecurityGroupId": sg_id, "MainRouteTableId": rtb_id,
     }
+    _ec2_vpc_dns_attributes(_ec2._vpcs[vpc_id], props)
+    _ec2_apply_tags(vpc_id, props)
     arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:vpc/{vpc_id}"
     return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
 
 
+# Create-only on AWS::EC2::VPC beside CidrBlock (the registry's
+# createOnlyProperties); the create does not model them.
+_EC2_VPC_CREATE_ONLY = ("Ipv4IpamPoolId", "Ipv4NetmaskLength", "VpcEncryptionControl")
+
+
+def _ec2_vpc_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a VPC in place. EnableDnsSupport, EnableDnsHostnames and Tags are
+    No interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpc.html);
+    CidrBlock, Ipv4IpamPoolId, Ipv4NetmaskLength and VpcEncryptionControl are
+    Replacement. InstanceTenancy is "Some interruptions", and the page is
+    explicit about the direction: dedicated to default is in place, default to
+    dedicated replaces.
+
+    The create mints a new vpc- id AND writes a default security group, main
+    route table and network ACL, none of which the delete removed, so every
+    property change left all three behind pointing at a VPC id nothing claims.
+    """
+    vpc = _ec2._vpcs.get(physical_id)
+    tenancy = new_props.get("InstanceTenancy", "default")
+    replaces_tenancy = (
+        old_props.get("InstanceTenancy", "default") == "default"
+        and tenancy == "dedicated"
+    )
+    # The record keeps none of the three create-only IPAM and encryption
+    # members, so they compare template to template.
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_props.get("CidrBlock", "10.0.0.0/16"), replaces_tenancy,
+         *(new_props.get(p) for p in _EC2_VPC_CREATE_ONLY)),
+        (vpc["CidrBlock"], False, *(old_props.get(p) for p in _EC2_VPC_CREATE_ONLY))
+        if vpc else None,
+        _ec2_vpc_create, _ec2_vpc_delete,
+    )
+    if replaced is not None:
+        return replaced
+    vpc["InstanceTenancy"] = tenancy
+    _ec2_vpc_dns_attributes(vpc, new_props, reset_absent=True)
+    _ec2_apply_tags(physical_id, new_props, old_props)
+    return physical_id, {
+        "VpcId": physical_id,
+        "DefaultSecurityGroup": vpc.get("DefaultSecurityGroupId", ""),
+        "DefaultNetworkAcl": vpc.get("DefaultNetworkAclId", ""),
+    }
+
+
 def _ec2_vpc_delete(physical_id, props):
-    _ec2._vpcs.pop(physical_id, None)
+    # Go through DeleteVpc: it removes the default security group, main route
+    # table and network ACL the create writes (popping only the VPC left all
+    # three behind for good), and it refuses with DependencyViolation while
+    # something made outside the stack still lives in the VPC, as AWS does.
+    children = [
+        child_id
+        for store in (_ec2._security_groups, _ec2._route_tables, _ec2._network_acls)
+        for child_id, child in store.items()
+        if child.get("VpcId") == physical_id
+    ]
+    status, _headers, body = _ec2._delete_vpc({"VpcId": [physical_id]})
+    if status >= 400 and b"InvalidVpcID.NotFound" not in body:
+        raise ValueError(f"AWS::EC2::VPC delete failed: {body!r}")
+    for child_id in children:
+        _ec2._tags.pop(child_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 def _ec2_vpc_endpoint_attributes(endpoint):
@@ -11327,7 +11424,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _kms_alias_delete,
     },
-    "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
+    "AWS::EC2::VPC": {
+        "create": _ec2_vpc_create,
+        "update": _ec2_vpc_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_vpc_delete,
+    },
     "AWS::EC2::VPCEndpoint": {
         "create": _ec2_vpc_endpoint_create,
         "update": _ec2_vpc_endpoint_update,
