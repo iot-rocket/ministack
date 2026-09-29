@@ -377,6 +377,62 @@ def test_sts_credential_rejections_require_auth(monkeypatch, auth_enabled, actio
         sts_svc._sessions.pop(key, None)
 
 
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("action", ["GetCallerIdentity", "GetSessionToken", "GetAccessKeyInfo"])
+@pytest.mark.parametrize("statement", [
+    None,
+    {"Effect": "Deny", "Action": "*", "Resource": "*"},
+    {"Effect": "Allow", "Action": "sts:GetAccessKeyInfo", "Resource": "*"},
+])
+def test_sts_policies_reach_only_get_access_key_info(monkeypatch, auth_enabled, action, statement):
+    """Under AUTH GetAccessKeyInfo needs an Allow; GetCallerIdentity and GetSessionToken always succeed."""
+    import asyncio
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    account = "000000000000"
+    user_name = "sts-deny-all-user"
+    key = "AKIASTSDENYALLACTIVE"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    previous = set(sts_svc._sessions)
+    with request_scope(account, "us-east-1"):
+        iam_svc._users.set_scoped(account, None, user_name, {
+            "UserName": user_name, "UserId": "AIDASTSDENYALLUSER", "Path": "/",
+            "Arn": f"arn:aws:iam::{account}:user/{user_name}", "AttachedPolicies": [],
+        })
+        if statement:
+            iam_svc._user_inline_policies[user_name] = {"p": {"Statement": [statement]}}
+        iam_svc._access_keys.set_scoped(account, None, key, {
+            "AccessKeyId": key, "SecretAccessKey": "secret", "Status": "Active", "UserName": user_name,
+        })
+        try:
+            status, _, payload = asyncio.run(app_mod._dispatch_service_request(
+                "POST", "/", {
+                    "host": "sts.localhost",
+                    "authorization": f"AWS4-HMAC-SHA256 Credential={key}/20260929/us-east-1/sts/aws4_request",
+                    "content-type": "application/x-www-form-urlencoded",
+                }, f"Action={action}&Version=2011-06-15&AccessKeyId={key}".encode(), {}, "req-1",
+            ))
+        finally:
+            iam_svc._access_keys.pop_scoped(account, None, key, None)
+            iam_svc._user_inline_policies.pop(user_name, None)
+            iam_svc._users.pop_scoped(account, None, user_name, None)
+            for created in set(sts_svc._sessions) - previous:
+                sts_svc._sessions.pop(created, None)
+    if auth_enabled and action == "GetAccessKeyInfo" and statement is None:
+        assert status == 403
+        assert (b"is not authorized to perform: sts:GetAccessKeyInfo because no identity-based policy "
+                b"allows the sts:GetAccessKeyInfo action") in payload
+    elif auth_enabled and action == "GetAccessKeyInfo" and statement["Effect"] == "Deny":
+        assert status == 403
+        assert b"AccessDenied" in payload
+    else:
+        assert status == 200
+
+
 def test_sts_assume_role_with_web_identity(sts, iam):
     iam.create_role(
         RoleName="test-oidc-role",
