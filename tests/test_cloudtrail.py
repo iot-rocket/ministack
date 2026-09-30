@@ -26,6 +26,15 @@ WEST_REGION = "us-west-2"
 DEFAULT_EVENT_SELECTORS = [
     {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
 ]
+MANAGEMENT_ADVANCED_SELECTORS = [
+    {
+        "Name": "writes",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Management"]},
+            {"Field": "readOnly", "Equals": ["false"]},
+        ],
+    }
+]
 
 
 def _client(service, region=REGION):
@@ -493,7 +502,7 @@ def test_put_get_event_selectors(ct):
 
     get_resp = ct.get_event_selectors(TrailName=name)
     assert get_resp["EventSelectors"] == selectors
-    assert get_resp["AdvancedEventSelectors"] == []
+    assert "AdvancedEventSelectors" not in get_resp
 
 
 def test_put_event_selectors_rejects_foreign_region_trail_arn(ct):
@@ -519,6 +528,54 @@ def test_get_event_selectors_by_arn_from_different_request_region(ct):
     resp = west_ct.get_event_selectors(TrailName=arn)
     assert resp["TrailARN"] == arn
     assert resp["EventSelectors"] == selectors
+
+
+def test_put_get_advanced_event_selectors(ct):
+    """Advanced selectors are stored and returned without EventSelectors, and basic ones replace them."""
+    name = f"trail-adv-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    put_resp = ct.put_event_selectors(TrailName=name, AdvancedEventSelectors=MANAGEMENT_ADVANCED_SELECTORS)
+    assert put_resp["AdvancedEventSelectors"] == MANAGEMENT_ADVANCED_SELECTORS
+    assert "EventSelectors" not in put_resp
+    get_resp = ct.get_event_selectors(TrailName=name)
+    assert get_resp["AdvancedEventSelectors"] == MANAGEMENT_ADVANCED_SELECTORS
+    assert "EventSelectors" not in get_resp
+
+    ct.put_event_selectors(TrailName=name, EventSelectors=DEFAULT_EVENT_SELECTORS)
+    get_resp = ct.get_event_selectors(TrailName=name)
+    assert get_resp["EventSelectors"] == DEFAULT_EVENT_SELECTORS
+    assert "AdvancedEventSelectors" not in get_resp
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"EventSelectors": DEFAULT_EVENT_SELECTORS, "AdvancedEventSelectors": MANAGEMENT_ADVANCED_SELECTORS},
+            "You can select events by using either EventSelectors or AdvancedEventSelectors, but not both.",
+        ),
+        (
+            {},
+            "You must select events by using either EventSelectors or AdvancedEventSelectors, but you cannot use both.",
+        ),
+        ({"EventSelectors": []}, "Specify a valid number of selectors (1 to 5) for your trail"),
+        (
+            {"EventSelectors": DEFAULT_EVENT_SELECTORS * 6},
+            "Specify a valid number of selectors (1 to 5) for your trail",
+        ),
+        ({"AdvancedEventSelectors": []}, "Specify between 1 and 500 selectors for your trail."),
+    ],
+    ids=["both", "neither", "no-basic", "six-basic", "no-advanced"],
+)
+def test_put_event_selectors_rejects_invalid_selector_lists(ct, kwargs, message):
+    """PutEventSelectors takes one to five basic selectors or at least one advanced selector."""
+    name = f"trail-sel-invalid-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    with pytest.raises(ClientError) as exc:
+        ct.put_event_selectors(TrailName=name, **kwargs)
+    assert exc.value.response["Error"]["Code"] == "InvalidEventSelectorsException"
+    assert exc.value.response["Error"]["Message"] == message
+    assert ct.get_event_selectors(TrailName=name)["EventSelectors"] == DEFAULT_EVENT_SELECTORS
 
 
 @pytest.mark.parametrize("region", [REGION, WEST_REGION])
