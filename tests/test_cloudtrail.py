@@ -191,7 +191,7 @@ def test_multi_region_trail_is_shadow_visible_from_peer_region(ct):
         S3BucketName="bucket",
         IsMultiRegionTrail=True,
     )["TrailARN"]
-    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
     ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
     west_ct = _client("cloudtrail", region=WEST_REGION)
 
@@ -493,10 +493,11 @@ def test_stop_logging_not_found(ct):
 
 
 def test_put_get_event_selectors(ct):
+    """Omitted members of a basic selector read back with their defaults."""
     name = f"trail-sel-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
-    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
-    put_resp = ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
+    put_resp = ct.put_event_selectors(TrailName=name, EventSelectors=[{"ReadWriteType": "WriteOnly"}])
     assert "TrailARN" in put_resp
     assert put_resp["EventSelectors"] == selectors
 
@@ -521,7 +522,7 @@ def test_put_event_selectors_rejects_foreign_region_trail_arn(ct):
 def test_get_event_selectors_by_arn_from_different_request_region(ct):
     name = f"trail-sel-cross-region-{_uid()}"
     arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
-    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
     ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
 
     west_ct = _client("cloudtrail", region="us-west-2")
@@ -545,6 +546,21 @@ def test_put_get_advanced_event_selectors(ct):
     get_resp = ct.get_event_selectors(TrailName=name)
     assert get_resp["EventSelectors"] == DEFAULT_EVENT_SELECTORS
     assert "AdvancedEventSelectors" not in get_resp
+
+
+def test_put_event_selectors_sets_has_custom_event_selectors(ct):
+    """HasCustomEventSelectors is true for any selectors other than the default one."""
+    name = f"trail-sel-custom-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    all_management = [{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}]}]
+    for kwargs, custom in (
+        ({"EventSelectors": [{"ReadWriteType": "WriteOnly"}]}, True),
+        ({"EventSelectors": [{}]}, False),
+        ({"AdvancedEventSelectors": all_management}, True),
+    ):
+        ct.put_event_selectors(TrailName=name, **kwargs)
+        assert ct.get_trail(Name=name)["Trail"]["HasCustomEventSelectors"] is custom
+        assert ct.describe_trails(trailNameList=[name])["trailList"][0]["HasCustomEventSelectors"] is custom
 
 
 @pytest.mark.parametrize(

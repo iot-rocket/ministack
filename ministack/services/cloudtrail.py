@@ -690,8 +690,9 @@ def _put_event_selectors(body: dict):
         return _err("InvalidEventSelectorsException", "Specify between 1 and 500 selectors for your trail.")
     if basic is not None and not 1 <= len(basic) <= 5:
         return _err("InvalidEventSelectorsException", "Specify a valid number of selectors (1 to 5) for your trail")
-    selectors = advanced or basic
+    selectors = advanced or [{**_DEFAULT_EVENT_SELECTORS[0], **selector} for selector in basic]
     _event_selectors.set_scoped(get_account_id(), home_region, name, selectors)
+    trail["HasCustomEventSelectors"] = selectors != _DEFAULT_EVENT_SELECTORS
     return _ok({"TrailARN": trail["TrailARN"], _event_selectors_field(selectors): selectors})
 
 
