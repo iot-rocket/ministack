@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFormation — `AWS::Logs::MetricFilter`** — templates with a metric filter failed with `Unrecognized resource types`; the filter now provisions, updates in place and is replaced on a `FilterName` or `LogGroupName` change. Contributed by @iot-rocket.
+
 ### Fixed
 - **CloudWatch Logs — `DescribeMetricFilters` by metric** — `metricName` and `metricNamespace` now select the filters that publish that metric, `filterNamePrefix` applies only with `logGroupName`, and `DeleteLogGroup` removes the group's filters. Contributed by @iot-rocket.
 

@@ -494,6 +494,7 @@ subnet = ec2.create_subnet(
 | `AWS::IAM::InstanceProfile` | Profile name | Arn |
 | `AWS::SSM::Parameter` | Parameter name | Type, Value |
 | `AWS::Logs::LogGroup` | Log group name | Arn |
+| `AWS::Logs::MetricFilter` | Filter name | — |
 | `AWS::Events::EventBus` | EventBus name | Arn, Name |
 | `AWS::Events::Rule` | Rule name | Arn |
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
