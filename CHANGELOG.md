@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudWatch Logs — `DescribeMetricFilters` by metric** — `metricName` and `metricNamespace` now select the filters that publish that metric, `filterNamePrefix` applies only with `logGroupName`, and `DeleteLogGroup` removes the group's filters. Contributed by @iot-rocket.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added
