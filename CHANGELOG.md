@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IoT — `UpdateJob`** — `PATCH /jobs/{jobId}` updates an `IN_PROGRESS` job's description, presigned URL, rollout, abort, timeout and retry configuration with AWS's checks; running executions keep their timeout. `CreateJob` refuses a bad timeout with the same message. Contributed by @iot-rocket.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added
