@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Signer — real signatures on the IoT platform** — when ACM holds the key of the profile's certificate, `StartSigningJob` on `AWSIoTDeviceManagement-SHA256-ECDSA` writes AWS's signed document instead of a JSON receipt, and an RSA key fails the job. Without a key the receipt stays and a warning is logged. Contributed by @iot-rocket.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added
