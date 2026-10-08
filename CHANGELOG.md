@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `Username` is the `sub` in pools with `UsernameAttributes`** — `AdminCreateUser` and `SignUp` now use the `sub` as the `Username`, keep the email or phone number as an alias, and refuse a `Username` that is not a sign-in attribute, a differing email or phone attribute and a caller-supplied `sub`. Contributed by @iot-rocket.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added
