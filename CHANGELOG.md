@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IoT — job and job execution events** — completed, canceled and deleted jobs and finished, removed or deleted executions publish to `$aws/events/job/...` and `$aws/events/jobExecution/...` when `UpdateEventConfigurations` enables them. Contributed by @iot-rocket.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added

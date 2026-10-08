@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import copy
 import hashlib
@@ -483,15 +484,8 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     """Route an IoT control-plane request, then publish the registry events it raised."""
-    events: list = []
-    token = _pending_events.set(events)
-    try:
-        response = await _route_request(method, path, headers, body, query_params)
-    finally:
-        _pending_events.reset(token)
-    for account_id, region, topic, event in events:
-        await _publish_event(account_id, region, topic, event)
-    return response
+    async with publishing_events():
+        return await _route_request(method, path, headers, body, query_params)
 
 
 async def _route_request(
@@ -3684,16 +3678,33 @@ async def _publish_event(account_id: str, region: str, topic: str, event: dict) 
         logger.warning("IoT event publish failed on %s", topic, exc_info=True)
 
 
+@contextlib.asynccontextmanager
+async def publishing_events():
+    """Collect the ``$aws/events`` messages raised inside the block and publish them after it."""
+    events: list = []
+    token = _pending_events.set(events)
+    try:
+        yield
+    finally:
+        _pending_events.reset(token)
+    for account_id, region, topic, event in events:
+        await _publish_event(account_id, region, topic, event)
+
+
+def _event_wanted(config_type: str) -> bool:
+    """Whether events are being collected and ``config_type`` is enabled for the account and region."""
+    enabled = (_event_config.get(_EVENT_CONFIG_KEY) or {}).get("enabled", ())
+    return _pending_events.get() is not None and config_type in enabled
+
+
 def _registry_event(
     config_type: str, topic: str, event_type: str, operation: str, fields: dict,
     event_id: str | None = None, with_account: bool = True,
 ) -> None:
     """Queue ``$aws/events/{topic}`` when ``config_type`` is enabled for the request's account and region."""
-    pending = _pending_events.get()
-    enabled = (_event_config.get(_EVENT_CONFIG_KEY) or {}).get("enabled", ())
-    if pending is None or config_type not in enabled:
+    if not _event_wanted(config_type):
         return
-    pending.append((get_account_id(), get_region(), f"$aws/events/{topic}", {
+    _pending_events.get().append((get_account_id(), get_region(), f"$aws/events/{topic}", {
         "eventType": event_type,
         "eventId": event_id or uuid.uuid4().hex,
         "timestamp": int(time.time() * 1000),
@@ -5033,6 +5044,7 @@ def _jobs_thing_left_group(thing: str) -> bool:
             continue
         execution["status"] = "REMOVED"
         execution["lastUpdatedAt"] = now
+        _job_execution_event(execution)
         removed = True
     return removed
 
@@ -5040,6 +5052,75 @@ def _jobs_thing_left_group(thing: str) -> bool:
 def _jobs_with_history(execution: dict) -> list[dict]:
     """A thing's executions of one job, newest first."""
     return [execution, *execution.get("history", [])]
+
+
+def _jobs_status_counts(job_id: str) -> dict:
+    """Executions of a job per status, a rejoined thing's earlier ones included."""
+    counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            for execution in _jobs_with_history(latest):
+                counts[execution["status"]] += 1
+    return counts
+
+
+def _job_event(job: dict, operation: str) -> None:
+    """Queue ``$aws/events/job/{jobId}/{operation}``; completed and canceled carry the execution counts."""
+    if not _event_wanted("JOB"):
+        return
+    fields = {
+        "jobId": job["jobId"],
+        "status": operation.upper(),
+        "targetSelection": job["targetSelection"],
+        "targets": list(job.get("targets") or []),
+        "createdAt": job["createdAt"],
+        "lastUpdatedAt": job["lastUpdatedAt"],
+        "timestamp": int(time.time()),
+    }
+    if job.get("description") is not None:
+        fields["description"] = job["description"]
+    if operation == "completed":
+        fields["completedAt"] = job["completedAt"]
+    if operation in ("cancellation_in_progress", "canceled"):
+        fields["forceCanceled"] = bool(job.get("forceCanceled"))
+        for member in ("comment", "reasonCode"):
+            if job.get(member) is not None:
+                fields[member] = job[member]
+    if operation in ("completed", "canceled"):
+        counts = _jobs_status_counts(job["jobId"])
+        fields["jobProcessDetails"] = {
+            f"numberOf{name}Things": counts[status]
+            for name, status in (
+                ("Canceled", "CANCELED"), ("Rejected", "REJECTED"), ("Failed", "FAILED"),
+                ("Removed", "REMOVED"), ("Succeeded", "SUCCEEDED"), ("TimedOut", "TIMED_OUT"),
+            )
+        }
+    _registry_event(
+        "JOB", f"job/{job['jobId']}/{operation}", "JOB", operation, fields,
+        str(uuid.uuid4()), with_account=False,
+    )
+
+
+def _job_execution_event(
+    execution: dict, status: str | None = None, force_canceled: bool | None = None
+) -> None:
+    """Queue ``$aws/events/jobExecution/{jobId}/{status}`` for an execution that reached ``status``."""
+    status = status or execution["status"]
+    fields = {
+        "jobId": execution["jobId"],
+        "thingArn": _thing_arn(execution["thingName"]),
+        "status": status,
+        "executionNumber": execution["executionNumber"],
+        "timestamp": int(time.time()),
+    }
+    if force_canceled is not None:
+        fields["forceCanceled"] = force_canceled
+    if execution.get("statusDetails"):
+        fields["statusDetails"] = dict(execution["statusDetails"])
+    _registry_event(
+        "JOB_EXECUTION", f"jobExecution/{execution['jobId']}/{status.lower()}",
+        "JOB_EXECUTION", status.lower(), fields, str(uuid.uuid4()), with_account=False,
+    )
 
 
 def _jobs_materialize_all() -> None:
@@ -5102,6 +5183,7 @@ def _jobs_apply_timeout(execution: dict) -> dict:
     execution["status"] = "TIMED_OUT"
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
+    _job_execution_event(execution)
     _jobs_maybe_complete(execution["jobId"])
     return execution
 
@@ -5127,6 +5209,7 @@ def _jobs_maybe_complete(job_id: str) -> None:
         job["status"] = "COMPLETED"
         job["completedAt"] = now
         job["lastUpdatedAt"] = now
+        _job_event(job, "completed")
 
 
 def _jobs_check_expected_version(
@@ -5375,11 +5458,7 @@ def _describe_job(job_id: str) -> tuple:
     _jobs_materialize_executions(job_id)
     # Every execution counts, a rejoined thing's earlier ones included
     # (measured eu-central-1 2026-10-05).
-    counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
-    for latest in _job_executions.values():
-        if latest["jobId"] == job_id:
-            for execution in _jobs_with_history(latest):
-                counts[execution["status"]] += 1
+    counts = _jobs_status_counts(job_id)
     job_doc = {
         **_job_summary(job),
         "targets": list(job.get("targets") or []),
@@ -5449,9 +5528,13 @@ async def _delete_job(job_id: str, qp: dict) -> tuple:
         and execution["status"] in ("QUEUED", "IN_PROGRESS")
     })
     prev_next = {t: jobs_first_pending_job_id(t) for t in affected}
+    job["lastUpdatedAt"] = _jobs_now_ms()
+    _job_event(job, "deletion_in_progress")
     del _jobs[job_id]
     for key in [k for k in _job_executions.keys() if k[1] == job_id]:
+        _job_execution_event(_job_executions[key], "DELETED")
         del _job_executions[key]
+    _job_event(job, "deleted")
     account_id, region = get_account_id(), get_region()
     for thing_name in affected:
         await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
@@ -5784,6 +5867,7 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
         job["comment"] = payload["comment"]
     if payload.get("reasonCode") is not None:
         job["reasonCode"] = payload["reasonCode"]
+    _job_event(job, "cancellation_in_progress")
     # QUEUED executions are always canceled with the job; IN_PROGRESS ones
     # only when force is set — as on AWS. Queue fronts are snapshotted before
     # the sweep so notify-next fires only where the front actually changed.
@@ -5804,7 +5888,9 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             execution["status"] = "CANCELED"
             execution["lastUpdatedAt"] = now
             execution["versionNumber"] += 1
+            _job_execution_event(execution, force_canceled=force)
             canceled_things.add(execution["thingName"])
+    _job_event(job, "canceled")
     account_id, region = get_account_id(), get_region()
     for thing_name in sorted(canceled_things):
         await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
@@ -5944,6 +6030,7 @@ async def _cancel_job_execution(
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
+    _job_execution_event(execution, force_canceled=force)
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
     return json_response({})
@@ -6122,6 +6209,8 @@ def jobs_update_execution(
         execution["timeoutStartedAt"] = now
     execution["lastUpdatedAt"] = now
     execution["versionNumber"] += 1
+    if status in _JOB_EXECUTION_TERMINAL:
+        _job_execution_event(execution)
     _jobs_maybe_complete(job_id)
     return dict(execution), None
 
@@ -7696,7 +7785,8 @@ async def broker_publish(
     jobs = _parse_jobs_topic(topic)
     if jobs is not None:
         try:
-            await _handle_jobs_publish(account_id, region, *jobs, payload)
+            async with publishing_events():
+                await _handle_jobs_publish(account_id, region, *jobs, payload)
         except Exception:
             # Same guard as the shadow bridge above.
             _broker_logger.warning(
