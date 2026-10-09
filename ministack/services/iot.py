@@ -35,8 +35,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``SearchIndex`` over the live registry, shadows and MQTT connectivity
   - Registry events: ``DescribeEventConfigurations`` /
     ``UpdateEventConfigurations``
-  - Jobs (control plane): ``CreateJob``, ``DescribeJob``, ``ListJobs``,
-    ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
+  - Jobs (control plane): ``CreateJob``, ``UpdateJob``, ``DescribeJob``,
+    ``ListJobs``, ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
     ``CancelJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
@@ -77,6 +77,7 @@ import re
 import ssl
 import struct
 import time
+import unicodedata
 import uuid
 import weakref
 from datetime import datetime, timezone
@@ -5133,13 +5134,17 @@ def _jobs_timeout_minutes(execution: dict, job: dict | None) -> int | None:
 
     ``stepTimeoutInMinutes`` from the device's own UpdateJobExecution wins over
     the job's ``timeoutConfig.inProgressTimeoutInMinutes``, which the reference
-    describes as applying to every execution of the job.
+    describes as applying to every execution of the job. An execution that was
+    running when UpdateJob changed the job's timeout keeps the earlier value.
     """
     step = execution.get("stepTimeoutInMinutes")
     if step is not None:
         return step
-    cfg = (job or {}).get("timeoutConfig") or {}
-    minutes = cfg.get("inProgressTimeoutInMinutes")
+    if "jobTimeoutInMinutes" in execution:
+        minutes = execution["jobTimeoutInMinutes"]
+    else:
+        cfg = (job or {}).get("timeoutConfig") or {}
+        minutes = cfg.get("inProgressTimeoutInMinutes")
     return minutes if isinstance(minutes, int) else None
 
 
@@ -5277,6 +5282,8 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return await _create_job(job_id, _parse_body(body))
     if method == "GET":
         return _describe_job(job_id)
+    if method == "PATCH":
+        return _update_job(job_id, _parse_body(body))
     if method == "DELETE":
         return await _delete_job(job_id, qp)
     return error_response_json(
@@ -5328,17 +5335,9 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             )
     timeout_cfg = payload.get("timeoutConfig") or {}
     if timeout_cfg:
-        minutes = timeout_cfg.get("inProgressTimeoutInMinutes")
-        try:
-            minutes = int(minutes)
-        except (TypeError, ValueError):
-            minutes = None
-        if minutes is None or not 1 <= minutes <= 10080:
-            return error_response_json(
-                "InvalidRequestException",
-                "inProgressTimeoutInMinutes must be between 1 and 10080",
-                400,
-            )
+        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -5435,6 +5434,218 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
     if payload.get("description") is not None:
         response["description"] = payload["description"]
     return json_response(response)
+
+
+# The members UpdateJob takes; each one given replaces the stored one whole.
+_JOB_UPDATE_MEMBERS = (
+    "description", "presignedUrlConfig", "jobExecutionsRolloutConfig",
+    "abortConfig", "timeoutConfig", "jobExecutionsRetryConfig",
+)
+_JOB_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+$")
+
+
+def _job_update_violations(job_id: str, payload: dict) -> list[str]:
+    """Model constraint failures of an UpdateJob request."""
+    found: list[str] = []
+
+    def bound(value, member, low=None, high=None, double=False):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        shown = float(value) if double else value
+        if low is not None and value < low:
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have value greater than or equal to {low}"))
+        elif high is not None and value > high:
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have value less than or equal to {high}"))
+
+    def enum(value, member, allowed):
+        if value is not None and value not in allowed:
+            found.append(_job_validation_clause(
+                value, member, f"Member must satisfy enum value set: {allowed}"))
+
+    def criteria_list(cfg, member, high=None):
+        items = cfg.get("criteriaList") if isinstance(cfg, dict) else None
+        if not isinstance(items, list):
+            return []
+        if not items:
+            found.append(_job_validation_clause(
+                "[]", member, "Member must have length greater than or equal to 1"))
+        elif high is not None and len(items) > high:
+            shown = "[" + ", ".join(
+                f"RetryCriteria(failureType={c.get('failureType')}, "
+                f"numberOfRetries={c.get('numberOfRetries')})" for c in items
+            ) + "]"
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have length less than or equal to {high}"))
+        return [c for c in items if isinstance(c, dict)]
+
+    # Fixed order, independent of the request's member order.
+    if len(job_id) > 64:
+        found.append(_job_validation_clause(
+            job_id, "jobId", "Member must have length less than or equal to 64"))
+    elif not _JOB_ID_RE.match(job_id):
+        found.append(_job_validation_clause(
+            job_id, "jobId", "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+"))
+    rollout = payload.get("jobExecutionsRolloutConfig") or {}
+    if isinstance(rollout, dict):
+        at = "jobExecutionsRolloutConfig"
+        bound(rollout.get("maximumPerMinute"), f"{at}.maximumPerMinute", low=1, high=1000)
+        rate = rollout.get("exponentialRate") or {}
+        if isinstance(rate, dict):
+            bound(rate.get("baseRatePerMinute"), f"{at}.exponentialRate.baseRatePerMinute",
+                  low=1, high=1000)
+            bound(rate.get("incrementFactor"), f"{at}.exponentialRate.incrementFactor",
+                  low=1.1, high=5, double=True)
+            criteria = rate.get("rateIncreaseCriteria") or {}
+            if isinstance(criteria, dict):
+                for name in ("numberOfNotifiedThings", "numberOfSucceededThings"):
+                    bound(criteria.get(name),
+                          f"{at}.exponentialRate.rateIncreaseCriteria.{name}", low=1)
+    description = payload.get("description")
+    if isinstance(description, str):
+        if len(description) > 2028:
+            found.append(_job_validation_clause(
+                description, "description",
+                "Member must have length less than or equal to 2028"))
+        elif any(unicodedata.category(ch).startswith("C") for ch in description):
+            found.append(_job_validation_clause(
+                description, "description",
+                r"Member must satisfy regular expression pattern: [^\p{C}]+"))
+    presign = payload.get("presignedUrlConfig") or {}
+    if isinstance(presign, dict):
+        bound(presign.get("expiresInSec"), "presignedUrlConfig.expiresInSec",
+              low=60, high=3600)
+    for i, c in enumerate(criteria_list(payload.get("jobExecutionsRetryConfig"),
+                                        "jobExecutionsRetryConfig.criteriaList", 2), 1):
+        at = f"jobExecutionsRetryConfig.criteriaList.{i}.member"
+        bound(c.get("numberOfRetries"), f"{at}.numberOfRetries", low=0, high=10)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED]")
+    for i, c in enumerate(criteria_list(payload.get("abortConfig"),
+                                        "abortConfig.criteriaList"), 1):
+        at = f"abortConfig.criteriaList.{i}.member"
+        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]")
+        enum(c.get("action"), f"{at}.action", "[CANCEL]")
+        bound(c.get("thresholdPercentage"), f"{at}.thresholdPercentage", high=100,
+              double=True)
+    return found
+
+
+def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
+    """Checks that need no job: they answer even for an unknown job id."""
+    violations = _job_update_violations(job_id, payload)
+    if violations:
+        return _job_validation_error(violations)
+    if all(payload.get(member) is None for member in _JOB_UPDATE_MEMBERS):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Update Job request for job {job_id} cannot be empty.", 400,
+        )
+    if payload.get("timeoutConfig") is not None:
+        err = _job_timeout_error(
+            (payload["timeoutConfig"] or {}).get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
+    rollout = payload.get("jobExecutionsRolloutConfig")
+    if isinstance(rollout, dict):
+        maximum, rate = rollout.get("maximumPerMinute"), rollout.get("exponentialRate")
+        message = None
+        if maximum is None:
+            message = (
+                "Provide MaximumPerMinute value when ExponentialRate is defined"
+                if rate is not None else
+                "Provide MaximumPerMinute value or provide ExponentialRate and "
+                "MaximumPerMinute"
+            )
+        elif isinstance(rate, dict):
+            criteria = rate.get("rateIncreaseCriteria") or {}
+            given = sum(criteria.get(name) is not None for name in (
+                "numberOfNotifiedThings", "numberOfSucceededThings"))
+            if given != 1:
+                message = (
+                    f"Provide {'either' if not given else 'only one of'} "
+                    "NumberOfNotifiedThings or NumberOfSucceededThings when "
+                    "RateIncreaseCriteria is defined"
+                )
+            elif (rate.get("baseRatePerMinute") or 0) > maximum:
+                message = (
+                    "Exponential rollout baseRatePerMinute should be less than "
+                    "maximumPerMinute."
+                )
+        if message:
+            return error_response_json("InvalidRequestException", message, 400)
+    role = (payload.get("presignedUrlConfig") or {}).get("roleArn")
+    if role is not None and not _JOB_ROLE_ARN_RE.match(str(role)):
+        return error_response_json(
+            "InvalidRequestException", f"Given role {role} is invalid.", 400
+        )
+    return None
+
+
+def _job_retry_update_error(job: dict, retry: dict) -> tuple | None:
+    """A retry config can only set the retries of its creation-time failure types to 0."""
+    criteria = [c for c in retry.get("criteriaList") or [] if isinstance(c, dict)]
+    message = None
+    if any(c.get("numberOfRetries") != 0 for c in criteria):
+        message = "The number of retries cannot be updated to any number other than 0."
+    elif len(criteria) > 1 and any(c.get("failureType") == "ALL" for c in criteria):
+        message = "A retryCriteria with failure type ALL must be used by itself."
+    elif not job.get("jobExecutionsRetryConfig"):
+        message = (
+            "RetryConfig cannot be updated if the job has no RetryConfig defined "
+            "during creation."
+        )
+    else:
+        existing = {
+            c.get("failureType")
+            for c in job["jobExecutionsRetryConfig"].get("criteriaList") or []
+        }
+        if {c.get("failureType") for c in criteria} != existing:
+            message = "FailureTypes must match existing FailureTypes defined in RetryConfig."
+    if message:
+        return error_response_json("InvalidRequestException", message, 400)
+    return None
+
+
+def _update_job(job_id: str, payload: dict) -> tuple:
+    err = _job_update_request_error(job_id, payload)
+    if err:
+        return err
+    job = _jobs.get(job_id)
+    if job is None:
+        return error_response_json(
+            "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+        )
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} in status {job['status']} cannot be updated.", 400,
+        )
+    if payload.get("jobExecutionsRetryConfig") is not None:
+        err = _job_retry_update_error(job, payload["jobExecutionsRetryConfig"])
+        if err:
+            return err
+    if payload.get("timeoutConfig") is not None:
+        # A running execution keeps the in-progress timeout it started with.
+        _jobs_materialize_executions(job_id)
+        minutes = (job.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
+        for execution in _job_executions.values():
+            if (
+                execution["jobId"] == job_id
+                and execution["status"] == "IN_PROGRESS"
+                and "jobTimeoutInMinutes" not in execution
+            ):
+                execution["jobTimeoutInMinutes"] = minutes
+    changes = {
+        member: copy.deepcopy(payload[member])
+        for member in _JOB_UPDATE_MEMBERS
+        if payload.get(member) is not None
+    }
+    _job_config_floats(changes)
+    job.update(changes)
+    job["lastUpdatedAt"] = _jobs_now_ms()
+    return 200, {}, b""
 
 
 def _job_summary(job: dict) -> dict:
@@ -5585,14 +5796,43 @@ def _job_template_arn(template_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:jobtemplate/{template_id}"
 
 
-def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+def _job_validation_clause(value, member: str, constraint: str) -> str:
     shown = "null" if value is None else f"'{value}'"
+    return f"Value {shown} at '{member}' failed to satisfy constraint: {constraint}"
+
+
+def _job_validation_error(clauses: list[str]) -> tuple:
+    noun = "error" if len(clauses) == 1 else "errors"
     return error_response_json(
         "InvalidRequestException",
-        f"1 validation error detected: Value {shown} at '{member}' failed to "
-        f"satisfy constraint: {constraint}",
+        f"{len(clauses)} validation {noun} detected: " + "; ".join(clauses),
         400,
     )
+
+
+def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+    return _job_validation_error([_job_validation_clause(value, member, constraint)])
+
+
+def _job_timeout_error(minutes) -> tuple | None:
+    if isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= 10080:
+        return None
+    return error_response_json(
+        "InvalidRequestException",
+        "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
+        f"{'null' if minutes is None else minutes}.",
+        400,
+    )
+
+
+def _job_config_floats(record: dict) -> None:
+    """The two `double` members read back as floats (25 comes back as 25.0)."""
+    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
+        if isinstance(criteria.get("thresholdPercentage"), int):
+            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
+    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
+    if isinstance(rate.get("incrementFactor"), int):
+        rate["incrementFactor"] = float(rate["incrementFactor"])
 
 
 def _job_template_id_error(template_id: str) -> tuple | None:
@@ -5646,13 +5886,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
             document, "document", "Member must have length less than or equal to 32768"
         )
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
-    if minutes is not None and not (isinstance(minutes, int) and 1 <= minutes <= 10080):
-        return error_response_json(
-            "InvalidRequestException",
-            "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
-            f"{minutes}.",
-            400,
-        )
+    if minutes is not None and (err := _job_timeout_error(minutes)):
+        return err
     source = payload.get("documentSource")
     if document and source:
         return error_response_json(
@@ -5699,13 +5934,7 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
     ):
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
-    # The two `double` members read back as floats (25 comes back as 25.0).
-    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
-        if isinstance(criteria.get("thresholdPercentage"), int):
-            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
-    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
-    if isinstance(rate.get("incrementFactor"), int):
-        rate["incrementFactor"] = float(rate["incrementFactor"])
+    _job_config_floats(record)
     _job_templates[template_id] = record
     return json_response({
         "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
