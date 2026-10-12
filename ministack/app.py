@@ -1755,8 +1755,8 @@ async def _handle_ses_v2_request(
     """Handle SES v2 REST API operations before generic routing."""
     if not path.startswith(_SES_V2_PREFIX):
         return None
-    if failure := _authenticate_only("sesv2", headers, query_params, request_id):
-        return failure
+    if denied := _enforce_ses_v2(method, path, headers, body, query_params, request_id):
+        return denied
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
@@ -2339,17 +2339,19 @@ def _authenticate_only(service: str, headers: dict, query_params: dict, request_
 
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
-    service_context: dict | None = None, auth_error_response=None,
+    service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
     ``service_context`` carries the request's own condition keys, for a path
     that has them. The generic router resolves those itself; a data-plane
     handler has to pass them, because it knows the resource the router does not.
+    ``named_resource`` is the resource an identity-policy denial names, in the
+    error Content-Type of the service, for the services that word it so.
     """
     if not AUTH:
         return None
-    from ministack.core.iam_actions import access_denied_response
+    from ministack.core.iam_actions import access_denied_response, identity_denial_message
     from ministack.core.iam_evaluator import AuthError, enforce
 
     access_key = extract_access_key_id(headers, query_params)
@@ -2359,10 +2361,33 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
-        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny",
-                                      resource_policy_arn=denied.resource_policy_arn)
+        explicit = denied.decision == "Deny"
+        message = ""
+        if named_resource and not (explicit and denied.resource_policy_arn):
+            message = identity_denial_message(iam_action, denied.principal_arn, named_resource, explicit)
+        response = access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                          message=message, explicit_deny=explicit,
+                                          resource_policy_arn=denied.resource_policy_arn)
+        if named_resource:
+            fix_error_content_type(service, response[0], response[1])
+        return response
     return None
+
+
+def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+    from ministack.core.responses import get_account_id
+
+    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("sesv2", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
+                                        extract_region(headers, query_params), get_account_id())
+    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
+                               named_resource=resource_arn)
 
 
 def _iceberg_targets_glue_catalog(path, query_params):
