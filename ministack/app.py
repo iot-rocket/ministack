@@ -1612,6 +1612,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
                                              resource_arn=resource)
                 if denied:
                     return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
         if is_mrap:
             handler = s3.handle_mrap_control
         elif is_object_lambda:
@@ -1623,6 +1625,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             or handler(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
@@ -1734,17 +1738,25 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
     )
 
 
-async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_rds_data_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle RDS Data API operations before generic routing."""
     if path not in _RDS_DATA_PATHS:
         return None
+    if failure := _authenticate_only("rds-data", headers, query_params, request_id):
+        return failure
     return await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
 
 
-async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_ses_v2_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle SES v2 REST API operations before generic routing."""
     if not path.startswith(_SES_V2_PREFIX):
         return None
+    if failure := _authenticate_only("sesv2", headers, query_params, request_id):
+        return failure
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
@@ -2315,6 +2327,16 @@ def _credential_failure(service: str, iam_action: str, request_id: str, denied, 
     return status, resp_headers, body
 
 
+def _authenticate_only(service: str, headers: dict, query_params: dict, request_id: str):
+    """Under AUTH, refuse a request no IAM action covers when its credentials fail."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import check_credentials
+
+    failure = check_credentials(extract_access_key_id(headers, query_params))
+    return _credential_failure(service, "", request_id, failure, headers) if failure else None
+
+
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
     service_context: dict | None = None, auth_error_response=None,
@@ -2410,9 +2432,9 @@ async def _handle_special_data_plane_request(
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
     if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
-    if response := await _handle_rds_data_request(method, path, headers, body, query_params):
+    if response := await _handle_rds_data_request(method, path, headers, body, query_params, request_id):
         return response
-    if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
+    if response := await _handle_ses_v2_request(method, path, headers, body, query_params, request_id):
         return response
     if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
         return _with_data_plane_headers(response, request_id)
@@ -2729,6 +2751,8 @@ async def _dispatch_service_request(
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        if iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
+            return failure
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
             resource_arn = extract_resource_arn(
