@@ -6059,7 +6059,7 @@ def _list_tags_for_resource(qp: dict) -> tuple:
 #   QUEUED → IN_PROGRESS → {SUCCEEDED, FAILED, REJECTED, CANCELED}
 #
 # `versionNumber` gives optimistic concurrency: every transition bumps it, and
-# a stale `expectedVersion` is rejected with a 409. `executionNumber` is NOT a
+# a stale `expectedVersion` is rejected. `executionNumber` is NOT a
 # concurrency token here. It counts a thing's executions of one job: 1 for the
 # first, one more each time the thing joins a CONTINUOUS job's target group
 # again after its last execution finished (AWS also increments it when a job
@@ -6217,7 +6217,6 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
         "jobId": job_id,
         "thingName": thing,
         "status": "QUEUED",
-        "statusDetails": {},
         "queuedAt": now,
         "startedAt": None,
         "lastUpdatedAt": now,
@@ -6602,16 +6601,16 @@ def _jobs_abort(job_id: str) -> dict:
 
 
 def _jobs_check_expected_version(
-    execution: dict, expected, conflict_code: str
+    execution: dict, expected, conflict_code: str, status: int = 409
 ) -> tuple | None:
     """Optimistic-concurrency gate, shared by the two update paths.
 
     The rejection message carries the current version so a device can resync
-    without a separate describe. `conflict_code` differs by plane and is NOT
-    cosmetic: the `iot` model declares VersionConflictException for
-    CancelJobExecution, while the `iot-jobs-data` model declares only
-    InvalidStateTransitionException for UpdateJobExecution — returning the
-    unmodeled code there makes a device's
+    without a separate describe. `conflict_code` and `status` differ by plane
+    and are NOT cosmetic: the `iot` model declares VersionConflictException
+    for CancelJobExecution, while UpdateJobExecution in the `iot-jobs-data`
+    model answers 400 InvalidRequestException — returning the unmodeled code
+    there makes a device's
     `except client.exceptions.VersionConflictException` raise AttributeError
     instead of catching, because botocore only synthesizes exception classes
     for the errors its model lists.
@@ -6629,7 +6628,7 @@ def _jobs_check_expected_version(
             conflict_code,
             f"Expected version {expected} but found version "
             f"{execution['versionNumber']}",
-            409,
+            status,
         )
     return None
 
@@ -7210,6 +7209,9 @@ def _describe_job(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     _jobs_materialize_executions(job_id)
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            _jobs_apply_timeout(latest)
     # Every execution counts, a rejoined thing's earlier ones included
     # (measured eu-central-1 2026-10-05).
     counts = _jobs_status_counts(job_id)
@@ -7744,7 +7746,7 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     executions = [
         execution
         for latest in _job_executions.values()
-        for execution in _jobs_with_history(latest)
+        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
     ]
     for execution in executions:
         if execution["thingName"] != thing:
@@ -7801,7 +7803,7 @@ def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
         execution
         for latest in _job_executions.values()
         if latest["jobId"] == job_id
-        for execution in _jobs_with_history(latest)
+        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
         if status is None or execution["status"] == status
     ]
     executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
@@ -7821,6 +7823,8 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
     """Without `executionNumber` the newest execution, with it that one."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
+    if execution is not None:
+        _jobs_apply_timeout(execution)
     number = qp.get("executionNumber")
     if execution is not None and number is not None:
         try:
@@ -7840,7 +7844,9 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
         "status": execution["status"],
         # Control-plane JobExecution nests the map under `detailsMap`
         # (JobExecutionStatusDetails); the data plane returns it flat.
-        "statusDetails": {"detailsMap": execution.get("statusDetails") or {}},
+        "statusDetails": (
+            {"detailsMap": execution["statusDetails"]} if execution.get("statusDetails") is not None else {}
+        ),
         "thingArn": _thing_arn(thing),
         "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
@@ -8244,12 +8250,9 @@ _JOBS_MQTT_EXECUTION_MEMBERS = (
 
 
 def _jobs_mqtt_execution(execution: dict, document) -> dict:
-    """A JobExecution as Jobs MQTT messages carry it: AWS's member order, no thingName, no empty statusDetails."""
+    """A JobExecution as Jobs MQTT messages carry it: AWS's member order, no thingName."""
     view = jobs_execution_view(execution, document)
-    return {
-        key: view[key] for key in _JOBS_MQTT_EXECUTION_MEMBERS
-        if key in view and (key != "statusDetails" or view[key])
-    }
+    return {key: view[key] for key in _JOBS_MQTT_EXECUTION_MEMBERS if key in view}
 
 
 def _jobs_mqtt_head(client_token, timestamp: int) -> dict:
@@ -8259,10 +8262,10 @@ def _jobs_mqtt_head(client_token, timestamp: int) -> dict:
     return head
 
 
-def _jobs_execution_state(execution: dict) -> dict:
-    """The executionState of a Jobs MQTT response: statusDetails only when set."""
+def jobs_execution_state(execution: dict) -> dict:
+    """The executionState of an update or a Jobs MQTT rejection: statusDetails only when set."""
     state = {"status": execution["status"]}
-    if execution.get("statusDetails"):
+    if execution.get("statusDetails") is not None:
         state["statusDetails"] = execution["statusDetails"]
     state["versionNumber"] = execution["versionNumber"]
     return state
@@ -8291,14 +8294,15 @@ def jobs_update_execution(
     expected_version=None,
     status_details: dict | None = None,
     step_timeout_minutes=None,
+    execution_number=None,
 ) -> tuple:
     """Apply a device-reported status to an execution.
 
     Returns ``(execution copy, None)``, or ``(None, error)`` for every
     rejection, in this order: an unknown status or one a device may not set
-    (QUEUED and the service-side statuses), unknown execution (404), stale or
-    non-numeric `expectedVersion`, and an already-terminal execution. A
-    successful update may complete the job.
+    (QUEUED and the service-side statuses), unknown execution or
+    `execution_number` (404), stale or non-numeric `expectedVersion`, and an
+    already-terminal execution. A successful update may complete the job.
     """
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
@@ -8316,6 +8320,8 @@ def jobs_update_execution(
         )
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing_name, job_id))
+    if execution_number is not None and execution and execution_number != execution["executionNumber"]:
+        execution = None
     if execution is None:
         return None, error_response_json(
             "ResourceNotFoundException",
@@ -8323,7 +8329,7 @@ def jobs_update_execution(
             404,
         )
     error = _jobs_check_expected_version(
-        execution, expected_version, "InvalidStateTransitionException"
+        execution, expected_version, "InvalidRequestException", 400
     )
     if error:
         return None, error
@@ -8335,7 +8341,7 @@ def jobs_update_execution(
         return None, error
     now = _jobs_now_ms()
     execution["status"] = status
-    if status_details:
+    if status_details is not None:
         execution["statusDetails"] = dict(status_details)
     # The first report starts the execution, unless the device rejects the job.
     if status != "REJECTED" and execution.get("startedAt") is None:
@@ -8372,12 +8378,13 @@ def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
         "jobId": execution["jobId"],
         "thingName": execution["thingName"],
         "status": execution["status"],
-        "statusDetails": execution.get("statusDetails") or {},
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
         "executionNumber": execution["executionNumber"],
         "versionNumber": execution["versionNumber"],
     }
+    if execution.get("statusDetails") is not None:
+        view["statusDetails"] = dict(execution["statusDetails"])
     if execution.get("startedAt") is not None:
         view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
     remaining = _jobs_seconds_before_timeout(execution)
@@ -9527,9 +9534,10 @@ def _jobs_error_tuple_to_rejected(
     """Map a jobs_* seam error (a ready HTTP response tuple) onto the MQTT
     rejected document.
 
-    The HTTP status folds onto the string ErrorCode enum; the three 409s all
-    share one HTTP ``__type`` (InvalidStateTransitionException), so the
-    specific code is read off the message sentence — every candidate
+    The HTTP status folds onto the string ErrorCode enum; the 409s share one
+    HTTP ``__type`` (InvalidStateTransitionException) and the version mismatch
+    shares the 400 with a bad request, so the specific code is read off the
+    message sentence — every candidate
     sentence is authored in this module (_jobs_check_expected_version,
     _jobs_reject_if_terminal, jobs_update_execution), so the match cannot
     drift silently. ``execution`` is the execution's current state, when it
@@ -9543,7 +9551,7 @@ def _jobs_error_tuple_to_rejected(
         message = ""
     if status == 404:
         code = "ResourceNotFound"
-    elif status == 400:
+    elif status == 400 and not message.startswith("Expected version"):
         code = "InvalidRequest"
     elif status == 410:
         code = "TerminalStateReached"
@@ -9555,7 +9563,7 @@ def _jobs_error_tuple_to_rejected(
     # A refused status carries no executionState.
     refused_status = message.startswith("The status of job execution cannot be changed")
     if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
-        execution_state = _jobs_execution_state(execution)
+        execution_state = jobs_execution_state(execution)
     return _jobs_rejected(code, message, client_token, execution_state)
 
 
@@ -9572,12 +9580,10 @@ async def _handle_jobs_publish(
     ``accepted`` / ``rejected`` responses back through the broker.
 
     Payload members (`statusDetails`, `expectedVersion`,
-    `includeJobExecutionState`, `includeJobDocument`, `clientToken`) follow
-    the device SDK contract and mirror the HTTP plane's handling; the request
-    members `stepTimeoutInMinutes` and `executionNumber` are accepted but
-    ignored — MiniStack has no execution timeouts, and `executionNumber` is
-    write-once so there is never more than one execution to address. Every
-    ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
+    `includeJobExecutionState`, `includeJobDocument`, `clientToken`,
+    `executionNumber`) follow the device SDK contract and mirror the HTTP
+    plane's handling; the request member `stepTimeoutInMinutes` is accepted
+    but ignored. Every ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
     served as a JSON object here (over HTTP it stays a string, as on AWS)."""
     base = f"{SHADOW_TOPIC_PREFIX}{thing}/jobs"
     suffix_base = f"{job_id}/{verb}" if job_id is not None else verb
@@ -9652,6 +9658,9 @@ async def _handle_jobs_publish(
                 execution = jobs_start_next_execution(thing, peek=True)
             else:
                 execution = jobs_describe_execution(thing, job_id)
+                number = request.get("executionNumber")
+                if number is not None and execution and number != execution["executionNumber"]:
+                    execution = None
             include_document = request.get("includeJobDocument", True)
             document = (
                 _jobs_job_document_object(execution["jobId"])
@@ -9687,6 +9696,7 @@ async def _handle_jobs_publish(
             status=request.get("status"),
             expected_version=request.get("expectedVersion"),
             status_details=request.get("statusDetails"),
+            execution_number=request.get("executionNumber"),
         )
         current = jobs_describe_execution(thing, job_id) if error else None
     if error:
@@ -9696,7 +9706,7 @@ async def _handle_jobs_publish(
         return
     doc = _jobs_mqtt_head(client_token, ts)
     if request.get("includeJobExecutionState"):
-        doc["executionState"] = _jobs_execution_state(execution)
+        doc["executionState"] = jobs_execution_state(execution)
     if request.get("includeJobDocument"):
         with request_scope(account_id, region):
             doc["jobDocument"] = _jobs_job_document_object(job_id, escape_non_bmp=True)

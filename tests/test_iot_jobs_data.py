@@ -1297,8 +1297,8 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         assert [e["jobId"] for e in pending["inProgressJobs"]] == [job_id]
         assert pending["queuedJobs"] == []
 
-        # A wrong expectedVersion is rejected with the code the iot-jobs-data
-        # model declares for UpdateJobExecution — InvalidStateTransitionException,
+        # A wrong expectedVersion is rejected with a code the iot-jobs-data
+        # model declares for UpdateJobExecution — InvalidRequestException (400),
         # NOT the VersionConflictException the control plane uses. botocore only
         # synthesizes exception classes for modeled errors, so an unmodeled code
         # would make the device's `except client.exceptions.…` raise
@@ -1306,16 +1306,16 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         # version so the device can resync without a separate describe.
         assert not hasattr(iot_jobs_data.exceptions, "VersionConflictException")
         with pytest.raises(
-            iot_jobs_data.exceptions.InvalidStateTransitionException
+            iot_jobs_data.exceptions.InvalidRequestException
         ) as ei:
             iot_jobs_data.update_job_execution(
                 jobId=job_id, thingName=thing, status="SUCCEEDED",
                 expectedVersion=1,
             )
         error = ei.value.response["Error"]
-        assert error["Code"] == "InvalidStateTransitionException"
-        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
-        assert "found version 2" in error["Message"]
+        assert error["Code"] == "InvalidRequestException"
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert error["Message"] == "Expected version 1 but found version 2"
 
         updated = iot_jobs_data.update_job_execution(
             jobId=job_id,
@@ -3396,6 +3396,40 @@ def test_iot_jobs_recreated_thing_starts_with_no_execution_history(
 # ---------------------------------------------------------------------------
 
 
+def test_iot_jobs_status_details_are_left_out_until_a_device_reports_them(
+    iot_client, iot_jobs_data
+):
+    """No statusDetails member until a device reports some; a reported empty map replaces the old one."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        def update(**kwargs):
+            return iot_jobs_data.update_job_execution(
+                jobId=job_id, thingName=thing, status="IN_PROGRESS",
+                includeJobExecutionState=True, **kwargs,
+            )["executionState"]
+
+        def device():
+            return iot_jobs_data.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+
+        def control():
+            return iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+
+        assert "statusDetails" not in device()
+        assert update() == {"status": "IN_PROGRESS", "versionNumber": 2}
+        assert "statusDetails" not in device()
+        assert control()["statusDetails"] == {}
+        assert update(statusDetails={"step": "1"})["statusDetails"] == {"step": "1"}
+        assert update()["statusDetails"] == {"step": "1"}
+        assert update(statusDetails={}) == {"status": "IN_PROGRESS", "statusDetails": {}, "versionNumber": 5}
+        assert device()["statusDetails"] == {}
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
 def test_iot_jobs_status_details_are_nested_on_the_control_plane_only(
     iot_client, iot_jobs_data
 ):
@@ -4467,6 +4501,36 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
     doc = _frames_by_topic(received)[f"{base}/get/accepted"]
     assert [q["jobId"] for q in doc["queuedJobs"]] == [job_id]
     assert doc["inProgressJobs"] == []
+
+
+def test_jobs_mqtt_unknown_execution_number_rejected(iot_client, iot_data_client):
+    """get and update with another executionNumber than the execution's answer ResourceNotFound."""
+    thing = _unique("jobs-mqtt-num")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+    base = f"$aws/things/{thing}/jobs"
+
+    def answer(verb, request):
+        received = _collect_shadow_frames(
+            f"{base}/{job_id}/{verb}/+",
+            lambda: _mqtt_publish(topic=f"{base}/{job_id}/{verb}", payload=json.dumps(request).encode()),
+            want=1,
+        )
+        ((topic, payload),) = received
+        return topic.rsplit("/", 1)[1], json.loads(payload)
+
+    kind, doc = answer("get", {"executionNumber": 9, "clientToken": "n1"})
+    assert (kind, doc["code"], doc["clientToken"]) == ("rejected", "ResourceNotFound", "n1")
+    kind, doc = answer("update", {"status": "IN_PROGRESS", "executionNumber": 9})
+    assert (kind, doc["code"]) == ("rejected", "ResourceNotFound")
+    execution = iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+    assert (execution["status"], execution["versionNumber"]) == ("QUEUED", 1)
+
+    kind, doc = answer("get", {"executionNumber": 1})
+    assert (kind, doc["execution"]["executionNumber"]) == ("accepted", 1)
+    kind, _ = answer("update", {"status": "IN_PROGRESS", "executionNumber": 1})
+    assert kind == "accepted"
 
 
 def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_client):
