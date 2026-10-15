@@ -6685,6 +6685,7 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
 # An S3 host: path style without a bucket label, virtual-hosted with one.
 _JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com")
 _JOB_DOCUMENT_MAX_BYTES = 32768
+_JOB_DOCUMENT_MAX_DEPTH = 1000
 
 
 def _job_document_s3_location(source: str) -> tuple[str, str]:
@@ -6704,6 +6705,27 @@ def _job_document_s3_location(source: str) -> tuple[str, str]:
                 bucket, _, key = parts.path[1:].partition("/")
                 key = unquote(key)
     return bucket, key
+
+
+def _job_document_is_json(document: str) -> bool:
+    """Whether a job document is JSON nested no deeper than AWS accepts."""
+    from ministack.services.apigateway_v1 import _json_depth
+
+    try:
+        value = json.loads(document)
+    except (ValueError, RecursionError):
+        return False
+    return _json_depth(value) <= _JOB_DOCUMENT_MAX_DEPTH
+
+
+def _job_inline_document_error(document) -> tuple | None:
+    """The refusal of a request's document that is not JSON AWS accepts, or None."""
+    if isinstance(document, str) and document and not _job_document_is_json(document):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document located at request input is an invalid JSON document.", 400,
+        )
+    return None
 
 
 def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
@@ -6738,8 +6760,9 @@ def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
         )
     try:
         document = _s3._get_object_data(bucket, key).decode("utf-8")
-        json.loads(document)
     except ValueError:
+        document = ""
+    if not _job_document_is_json(document):
         return None, error_response_json(
             "InvalidRequestException",
             f"Job document located at {source} is an invalid JSON document.",
@@ -6868,6 +6891,8 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "InvalidRequestException",
             "document exceeds the maximum length of 32768", 400,
         )
+    if err := _job_inline_document_error(document):
+        return err
     source = payload.get("documentSource")
     if isinstance(source, str) and not 1 <= len(source) <= 1350:
         return error_response_json(
@@ -7433,6 +7458,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         return _job_template_validation_error(
             document, "document", "Member must have length less than or equal to 32768"
         )
+    if err := _job_inline_document_error(document):
+        return err
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
     if minutes is not None and (err := _job_timeout_error(minutes)):
         return err
@@ -8067,18 +8094,35 @@ def _jobs_device_float(value: float) -> str:
 
 def _jobs_device_json(value) -> str:
     """Compact JSON of a job document as AWS sends it to a device: object members that are null are left out."""
-    if isinstance(value, dict):
-        return "{" + ",".join(
-            f"{_jobs_device_json(key)}:{_jobs_device_json(member)}"
-            for key, member in value.items() if member is not None
-        ) + "}"
-    if isinstance(value, list):
-        return "[" + ",".join(map(_jobs_device_json, value)) + "]"
-    if isinstance(value, str):
-        return '"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"'
-    if isinstance(value, float):
-        return _jobs_device_float(value)
-    return json.dumps(value)
+    parts: list[str] = []
+    # Values still to write, last first; a tuple holds punctuation (json.loads makes none).
+    pending = [value]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, tuple):
+            parts.append(value[0])
+        elif isinstance(value, dict):
+            members = [(key, member) for key, member in value.items() if member is not None]
+            parts.append("{")
+            pending.append(("}",))
+            for index in range(len(members) - 1, -1, -1):
+                key, member = members[index]
+                pending.append(member)
+                pending.append(("," * bool(index) + '"' + key.translate(_JOBS_DEVICE_ESCAPES) + '":',))
+        elif isinstance(value, list):
+            parts.append("[")
+            pending.append(("]",))
+            for index in range(len(value) - 1, -1, -1):
+                pending.append(value[index])
+                if index:
+                    pending.append((",",))
+        elif isinstance(value, str):
+            parts.append('"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"')
+        elif isinstance(value, float):
+            parts.append(_jobs_device_float(value))
+        else:
+            parts.append(json.dumps(value))
+    return "".join(parts)
 
 
 # The host a device reached MiniStack on: its presigned URLs name it.
@@ -8236,7 +8280,7 @@ def _jobs_job_document_object(job_id: str, escape_non_bmp: bool = False):
     document = jobs_job_document(job_id)
     try:
         json.loads(document)
-    except ValueError:
+    except (ValueError, RecursionError):
         return document
     if escape_non_bmp:
         document = _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, document)

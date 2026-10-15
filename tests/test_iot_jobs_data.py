@@ -348,6 +348,94 @@ def test_iot_jobs_document_source_refusals(iot_client, s3):
         _delete_bucket(s3, bucket)
 
 
+def test_iot_jobs_document_nesting_limit(iot_client, iot_jobs_data, s3):
+    """A document nested deeper than 1000 levels, or not JSON, refuses the job or template."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    jobs, templates = [], []
+    deepest = {
+        "array": "[ " * 1000 + "]" * 1000,
+        "object": '{ "a": ' * 1000 + "1" + " }" * 1000,
+    }
+    compact = {"array": "[" * 1000 + "]" * 1000, "object": '{"a":' * 1000 + "1" + "}" * 1000}
+    refused = {
+        "array": "[" * 1001 + "]" * 1001,
+        "object": '{"a":' * 1001 + "1" + "}" * 1001,
+        "beyond the parser": "[" * 16000 + "]" * 16000,
+        "not JSON": "not json",
+    }
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        for kind, document in refused.items():
+            s3.put_object(Bucket=bucket, Key=f"{kind}.json", Body=document)
+            source = f"s3://{bucket}/{kind}.json"
+            for request, where in (({"document": document}, "request input"), ({"documentSource": source}, source)):
+                message = f"Job document located at {where} is an invalid JSON document."
+                job_id, template_id = _unique("job"), _unique("tmpl")
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job(jobId=job_id, targets=[thing_arn], **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), kind
+                with pytest.raises(ClientError) as ei:
+                    iot_client.describe_job(jobId=job_id)
+                assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job_template(jobTemplateId=template_id, description="d", **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), kind
+
+        # Brackets inside a string are no nesting.
+        jobs.append(_unique("job"))
+        iot_client.create_job(
+            jobId=jobs[-1], targets=[thing_arn], document=json.dumps({"s": "[" * 1001})
+        )
+
+        # 1000 levels are accepted; the device gets them compact.
+        for kind, document in deepest.items():
+            s3.put_object(Bucket=bucket, Key=f"{kind}.json", Body=document)
+            for request in ({"document": document}, {"documentSource": f"s3://{bucket}/{kind}.json"}):
+                jobs.append(_unique("job"))
+                iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], **request)
+                assert iot_client.get_job_document(jobId=jobs[-1])["document"] == document
+                execution = iot_jobs_data.describe_job_execution(
+                    jobId=jobs[-1], thingName=thing, includeJobDocument=True
+                )["execution"]
+                assert execution["jobDocument"] == compact[kind], kind
+                templates.append(_unique("tmpl"))
+                iot_client.create_job_template(jobTemplateId=templates[-1], description="d", **request)
+                desc = iot_client.describe_job_template(jobTemplateId=templates[-1])
+                assert desc["document"] == document
+    finally:
+        _delete_templates(iot_client, *templates)
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_with_unterminated_strings_is_refused(iot_client):
+    """A document of escaped quotes without a closing one is refused."""
+    thing = _unique("jobs-thing")
+    document = '"' + '\\"' * 16383
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job(jobId=_unique("job"), targets=[thing_arn], document=document)
+        message = "Job document located at request input is an invalid JSON document."
+        assert _error(ei) == (400, "InvalidRequestException", message)
+    finally:
+        _cleanup(iot_client, things=[thing])
+
+
+def test_iot_jobs_stored_document_too_deep_to_parse_stays_text():
+    """A stored document too deep for the JSON parser reaches the device as its text."""
+    from ministack.services import iot as iot_module
+
+    job_id, document = _unique("job"), "[" * 16000 + "]" * 16000
+    iot_module._jobs[job_id] = {"jobId": job_id, "document": document}
+    try:
+        assert iot_module.jobs_job_document(job_id) == document
+        assert iot_module._jobs_job_document_object(job_id) == document
+    finally:
+        iot_module._jobs.pop(job_id, None)
+
+
 def test_iot_jobs_document_source_is_read_in_the_callers_account():
     """The bucket is looked up in the caller's account, in any of its regions."""
     owner_s3 = _account_client("s3", "111111111111")
