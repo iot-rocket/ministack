@@ -14,6 +14,7 @@ data-plane responses use raw `long` shapes carrying whole epoch seconds
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -3825,6 +3826,11 @@ def _frames_by_topic(received):
     return {topic: json.loads(payload) for topic, payload in received}
 
 
+def _unstamped(payload):
+    """A raw Jobs MQTT payload with each epoch-seconds stamp as 0, every other byte as sent."""
+    return re.sub(r'(?<=":)\d{10}(?=[,}])', "0", payload.decode("utf-8"))
+
+
 def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client):
     """CreateJob publishes notify (per-status aggregate) + notify-next (full
     execution incl. the jobDocument as an object) to each target thing; a
@@ -3875,6 +3881,58 @@ def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client
     assert doc["inProgressJobs"] == []
     _assert_epoch_seconds(doc["timestamp"])
     _assert_epoch_seconds(doc["queuedJobs"][0]["queuedAt"])
+
+
+def test_jobs_mqtt_messages_are_compact_in_aws_member_order(iot_client, iot_data_client):
+    """Jobs MQTT messages are compact UTF-8 in AWS's member order, clientToken first, without thingName."""
+    thing = _unique("jobs-mqtt-raw")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    summary = (
+        f'{{"jobId":"{job_id}","queuedAt":0,"lastUpdatedAt":0,'
+        '"executionNumber":1,"versionNumber":1}'
+    )
+    execution = (
+        f'{{"jobId":"{job_id}","status":"QUEUED","queuedAt":0,"lastUpdatedAt":0,'
+        '"versionNumber":1,"executionNumber":1,"jobDocument":{"s":"\u00e9 \U0001f600","f":1.0E21}}'
+    )
+    try:
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.create_job(
+                jobId=job_id,
+                targets=[thing_arn],
+                document='{"s": "\\u00e9 \\ud83d\\ude00", "f": 1e21}',
+            ),
+            want=2,
+        )
+        frames = {topic: _unstamped(payload) for topic, payload in received}
+        assert frames[f"{base}/notify"] == f'{{"timestamp":0,"jobs":{{"QUEUED":[{summary}]}}}}'
+        assert frames[f"{base}/notify-next"] == f'{{"timestamp":0,"execution":{execution}}}'
+        for topic, request, accepted in (
+            (
+                "get",
+                {"clientToken": "tok"},
+                f'{{"clientToken":"tok","timestamp":0,"inProgressJobs":[],"queuedJobs":[{summary}]}}',
+            ),
+            (
+                f"{job_id}/get",
+                {"clientToken": "tok"},
+                f'{{"clientToken":"tok","timestamp":0,"execution":{execution}}}',
+            ),
+            (f"{job_id}/get", {}, f'{{"timestamp":0,"execution":{execution}}}'),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/accepted",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            assert [_unstamped(payload) for _, payload in received] == [accepted]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_create_behind_existing_job_no_notify_next(
@@ -4054,6 +4112,60 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     assert topics.index(f"{base}/{job_id}/update/accepted") < topics.index(
         f"{base}/notify"
     ) < topics.index(f"{base}/notify-next")
+
+
+def test_jobs_mqtt_status_details_and_update_responses_escape_non_bmp(
+    iot_client, iot_data_client
+):
+    """statusDetails and update responses escape characters beyond the BMP; the job document elsewhere does not."""
+    thing = _unique("jobs-mqtt-bmp")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    details = '"statusDetails":{"k":"\u00e9 \\uD83D\\uDE00"}'
+    try:
+        iot_client.create_job(
+            jobId=job_id, targets=[thing_arn], document='{"s": "\\u00e9 \\ud83d\\ude00"}'
+        )
+        for topic, request, answer, expected in (
+            (
+                "start-next",
+                {"statusDetails": {"k": "\u00e9 \U0001f600"}, "clientToken": "tok"},
+                "accepted",
+                f'{{"clientToken":"tok","timestamp":0,"execution":{{"jobId":"{job_id}",'
+                f'"status":"IN_PROGRESS",{details},"queuedAt":0,"startedAt":0,"lastUpdatedAt":0,'
+                '"versionNumber":2,"executionNumber":1,"jobDocument":{"s":"\u00e9 \U0001f600"}}}',
+            ),
+            (
+                f"{job_id}/update",
+                {
+                    "status": "IN_PROGRESS",
+                    "includeJobExecutionState": True,
+                    "includeJobDocument": True,
+                    "clientToken": "tok",
+                },
+                "accepted",
+                f'{{"clientToken":"tok","timestamp":0,"executionState":{{"status":"IN_PROGRESS",{details},'
+                '"versionNumber":3},"jobDocument":{"s":"\u00e9 \\uD83D\\uDE00"}}',
+            ),
+            (
+                f"{job_id}/update",
+                {"status": "IN_PROGRESS", "expectedVersion": 9},
+                "rejected",
+                f'{{"timestamp":0,"executionState":{{"status":"IN_PROGRESS",{details},"versionNumber":3}},'
+                '"code":"VersionMismatch","message":"Expected version 9 but found version 3"}',
+            ),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/{answer}",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            assert [_unstamped(payload) for _, payload in received] == [expected]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_presigned_urls(iot_client, iot_data_client, s3, iam):
@@ -4376,6 +4488,38 @@ def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_cli
     )
     execution = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"]
     assert execution["jobDocument"] == {"o": {"k": [None]}, "f": ["Infinity", 2.5]}
+
+
+def test_jobs_mqtt_null_job_document_is_sent_as_null(iot_client, iot_data_client):
+    """A job document that is JSON null reaches the device as "jobDocument":null on every MQTT path."""
+    thing = _unique("jobs-mqtt-null")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    try:
+        received = _collect_shadow_frames(
+            f"{base}/notify-next",
+            lambda: iot_client.create_job(jobId=job_id, targets=[thing_arn], document="null"),
+            want=1,
+        )
+        documents = [json.loads(received[0][1])["execution"]]
+        for topic, request in (
+            (f"{job_id}/get", {}),
+            ("start-next", {}),
+            (f"{job_id}/update", {"status": "SUCCEEDED", "includeJobDocument": True}),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/accepted",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            accepted = json.loads(received[0][1])
+            documents.append(accepted.get("execution", accepted))
+        assert [document.get("jobDocument", "absent") for document in documents] == [None] * 4
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
