@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — unknown topic rules answer 401** — `GetTopicRule` and `ReplaceTopicRule` on a rule that does not exist answered 404 `ResourceNotFoundException` and `DeleteTopicRule` answered 200; they now answer 401 `UnauthorizedException` (`Access to topic rule '<name>' was denied`) as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
