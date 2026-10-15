@@ -2107,7 +2107,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:
