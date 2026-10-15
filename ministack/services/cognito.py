@@ -7472,10 +7472,19 @@ def _update_identity_pool(data):
 
 
 def _get_id(data):
+    from ministack.app import AUTH
     iid = data.get("IdentityPoolId")
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    if AUTH:
+        logins = data.get("Logins") or {}
+        error = _identity_logins_error(pool, None, logins)
+        if error:
+            return error
+        owner = _login_owner(pool, logins)
+        if owner:
+            return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
     pool["_identities"][identity_id] = {
         "IdentityId": identity_id,
@@ -7522,6 +7531,7 @@ def _get_credentials_for_identity(data):
     ``CognitoIdentityCredentials`` — GetCallerIdentity reports
     ``arn:aws:sts::<account>:assumed-role/<RoleName>/CognitoIdentityCredentials``.
     """
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     now = int(time.time())
     logins = data.get("Logins") or {}
@@ -7529,6 +7539,11 @@ def _get_credentials_for_identity(data):
     for _iid, candidate in _identity_pools.items():
         if identity_id in candidate.get("_identities", {}):
             pool = candidate
+            if AUTH:
+                error = _identity_logins_error(candidate, identity_id, logins)
+                if error:
+                    return error
+                _link_logins(candidate, identity_id, logins)
             if not logins:
                 logins = candidate["_identities"][identity_id].get("Logins") or {}
             break
@@ -7580,26 +7595,30 @@ def _get_credentials_for_identity(data):
 _LOGIN_TOKEN_CLOCK_SKEW = 300
 
 
-def _open_id_token_logins_error(pool: dict, identity_id: str, logins: dict):
-    """The NotAuthorizedException for GetOpenIdToken Logins AWS would not accept, or None."""
-    stored = pool["_identities"][identity_id].get("Logins") or {}
+def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
+    """The NotAuthorizedException for Logins AWS would not accept for an identity (None: a new one), or None."""
+    stored = (pool["_identities"][identity_id].get("Logins") or {}) if identity_id else {}
     if not logins:
         if not stored:
             return None
         return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
     unsupported = "Token is not from a supported provider of this identity pool."
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
     skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
     for provider, token in logins.items():
-        # Only user pool logins are verified; other providers' tokens are opaque here.
-        if not provider.startswith("cognito-idp."):
-            continue
         clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
                    if p.get("ProviderName") == provider]
         claims = _token_claims(token)
-        if not clients:
+        is_jwt = isinstance(token, str) and token.count(".") == 2 and bool(claims)
+        if provider == "accounts.google.com" and not is_jwt and provider in (pool.get("SupportedLoginProviders") or {}):
+            message = not_oidc
+        elif not provider.startswith("cognito-idp."):
+            # Other providers' tokens are opaque here.
+            continue
+        elif not clients:
             message = unsupported
-        elif not isinstance(token, str) or token.count(".") != 2 or not claims:
-            message = "Invalid login token. Not a valid OpenId Connect identity token."
+        elif not is_jwt:
+            message = not_oidc
         elif claims.get("iss") != f"https://{provider}":
             message = "Invalid login token. Issuer doesn't match providerName"
         elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
@@ -7619,6 +7638,25 @@ def _open_id_token_logins_error(pool: dict, identity_id: str, logins: dict):
     return None
 
 
+def _login_owner(pool: dict, logins: dict):
+    """The id of the pool's identity that already holds one of these logins, or None."""
+    for provider, token in logins.items():
+        sub = _token_claims(token).get("sub")
+        for identity_id, identity in pool["_identities"].items():
+            held = (identity.get("Logins") or {}).get(provider)
+            if held is not None and (held == token or (sub and _token_claims(held).get("sub") == sub)):
+                return identity_id
+    return None
+
+
+def _link_logins(pool: dict, identity_id: str, logins: dict) -> None:
+    """Give an identity without a login the call's Logins unless another identity holds them."""
+    identity = pool["_identities"][identity_id]
+    if logins and not identity.get("Logins") and not _login_owner(pool, logins):
+        identity["Logins"] = dict(logins)
+        identity["LastModifiedDate"] = _now_epoch()
+
+
 def _get_open_id_token(data):
     from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
@@ -7628,9 +7666,11 @@ def _get_open_id_token(data):
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
-            error = _open_id_token_logins_error(pool, identity_id, logins) if AUTH else None
-            if error:
-                return error
+            if AUTH:
+                error = _identity_logins_error(pool, identity_id, logins)
+                if error:
+                    return error
+                _link_logins(pool, identity_id, logins)
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:
