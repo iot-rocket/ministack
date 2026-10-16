@@ -4359,6 +4359,25 @@ def test_iot_missing_topic_rule_unauthorized(iot_client):
             401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
 
 
+def test_iot_get_replace_delete_topic_rule_name_pattern_refused(iot_client):
+    """Get, Replace and Delete refuse a rule name outside the pattern with 400, as Enable does."""
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName="bad-name"),
+        lambda: iot_client.replace_topic_rule(
+            ruleName="bad-name", topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName="bad-name"),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException",
+            "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
+
+
 def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
     stack = "iot-topicrule-" + uuid.uuid4().hex[:8]
     rule = _rule_name("ingest")

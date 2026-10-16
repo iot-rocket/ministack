@@ -5826,7 +5826,18 @@ def _error_rule_denied(name: str) -> tuple:
     )
 
 
+def _error_rule_name(name: str) -> tuple:
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+        400,
+    )
+
+
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
     try:
@@ -5839,6 +5850,8 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
         return _error_rule_denied(name)
@@ -5848,12 +5861,7 @@ def _get_topic_rule(name: str) -> tuple:
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
     if not _RULE_NAME_RE.match(name):
-        return error_response_json(
-            "InvalidRequestException",
-            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-            400,
-        )
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
         return _error_rule_denied(name)
@@ -5862,6 +5870,8 @@ def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
 
 
 def _delete_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
     delete_topic_rule(name)
