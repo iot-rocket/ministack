@@ -1000,6 +1000,96 @@ def test_iot_ws_handshake_signature_contract(auth_enabled, iam_user, case):
         assert status == 101
 
 
+async def _mqtt_over_signed_ws(query: str, packets: list[bytes]) -> list[str]:
+    """The packets the broker answers over an MQTT WebSocket signed in ``query``, named; a PINGREQ goes last."""
+    names: list[str] = []
+    async with websockets.connect(f"ws://{_iot_ws_host()}/mqtt?{query}", subprotocols=["mqtt"]) as ws:
+        try:
+            for packet in (*packets, b"\xc0\x00"):
+                await ws.send(packet)
+            while "PINGRESP" not in names:
+                buf = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
+                while parsed := _parse_packet(bytes(buf)):
+                    kind, _flags, body, used = parsed
+                    buf = buf[used:]
+                    names.append({
+                        2: lambda: f"CONNACK {body[1]:#04x}",
+                        3: lambda: f"PUBLISH {_dec_str(body, 0)[0]}",
+                        4: lambda: f"PUBACK {body[2] if len(body) > 2 else 0:#04x}",
+                        9: lambda: f"SUBACK {body[-1]:#04x}",
+                        13: lambda: "PINGRESP",
+                        14: lambda: f"DISCONNECT {body[0] if body else 0:#04x}",
+                    }[kind]())
+        except websockets.ConnectionClosed:
+            pass
+    return names
+
+
+_MQTT_WS_CASES = {  # case: (packets as (kind, name, v5), names under AUTH=true, names with AUTH off)
+    "connect-allowed": ([("connect", "dev-1", False)], ["CONNACK 0x00", "PINGRESP"], None),
+    "connect-other-client": ([("connect", "other", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-denied-client": ([("connect", "dev-denied", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-other-client-v5": ([("connect", "other", True)], ["CONNACK 0x87"], ["CONNACK 0x00", "PINGRESP"]),
+    "receive-allowed": ([("connect", "dev-1", False), ("subscribe", "t/a", False), ("publish", "t/a", False)],
+                        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/a", "PINGRESP"], None),
+    "receive-not-allowed": (
+        [("connect", "dev-1", False), ("subscribe", "t/nr", False), ("publish", "t/nr", False)],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PINGRESP"],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/nr", "PINGRESP"]),
+    "publish-other-topic": ([("connect", "dev-1", False), ("publish", "other/x", False)], ["CONNACK 0x00"],
+                            ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "publish-denied-topic": ([("connect", "dev-1", False), ("publish", "t/denied", False)], ["CONNACK 0x00"],
+                             ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter": ([("connect", "dev-1", False), ("subscribe", "other/x", False)], ["CONNACK 0x00"],
+                               ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+    "publish-other-topic-v5": ([("connect", "dev-1", True), ("publish", "other/x", True)],
+                               ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                               ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "retain-without-retain-publish-v5": ([("connect", "dev-1", True), ("retain", "t/a", True)],
+                                         ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                                         ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter-v5": ([("connect", "dev-1", True), ("subscribe", "other/x", True)],
+                                  ["CONNACK 0x00", "SUBACK 0x87", "PINGRESP"],
+                                  ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("signer", ["user", "session", "root"])
+@pytest.mark.parametrize("case", list(_MQTT_WS_CASES))
+def test_iot_ws_session_iam_policy_contract(auth_enabled, iam_user, case, signer):
+    """Under AUTH=true an IAM-signed MQTT-over-WebSocket session is held to the signer's IAM policies."""
+    run = _unique("p")
+    statements = [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-*"},
+        {"Effect": "Deny", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-denied"},
+        {"Effect": "Allow", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/*"},
+        {"Effect": "Deny", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/denied"},
+        {"Effect": "Allow", "Action": "iot:Subscribe", "Resource": f"arn:aws:iot:*:*:topicfilter/{run}/t/*"},
+        {"Effect": "Allow", "Action": "iot:Receive", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/a"},
+        {"Effect": "Allow", "Action": "sts:GetSessionToken", "Resource": "*"},
+    ]
+    packets, strict, permissive = _MQTT_WS_CASES[case]
+    frames = []
+    for kind, name, v5 in packets:
+        level = MQTT_5 if v5 else MQTT_311
+        if kind == "connect":
+            frames.append(_make_connect(f"{run}-{name}", protocol_level=level))
+        elif kind == "subscribe":
+            frames.append(_make_subscribe(1, f"{run}/{name}", qos=1, protocol_level=level))
+        else:
+            frames.append(_make_publish(f"{run}/{name}", b"{}", qos=1, packet_id=2, protocol_level=level,
+                                        retain=kind == "retain"))
+    with _second_access_key(iam_user(policy={"Version": "2012-10-17", "Statement": statements})) as (key, secret):
+        if signer == "root":
+            key, secret = "test", "test"
+        query, _ = _signed_mqtt_upgrade(key, secret, session=signer == "session",
+                                        token="session" if signer == "session" else None)
+        names = asyncio.run(_mqtt_over_signed_ws(query, frames))
+    expected = strict if auth_enabled and signer != "root" else (permissive or strict)
+    assert sorted(names) == sorted(n.replace(" t/", f" {run}/t/") for n in expected)
+
+
 # ---------------------------------------------------------------------------
 # Device Shadow (GetThingShadow / UpdateThingShadow / DeleteThingShadow)
 # ---------------------------------------------------------------------------
