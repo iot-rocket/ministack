@@ -5331,6 +5331,29 @@ def test_oauth2_userinfo_refuses_revoked_tokens_and_disabled_users(auth_enabled,
     assert _userinfo(kept["access_token"])[0] == 200
 
 
+@pytest.mark.auth_contract
+def test_oauth2_userinfo_requires_the_openid_scope(auth_enabled, cognito_idp):
+    pid, cid, sign_in = _userinfo_pool(cognito_idp, "bob")
+
+    def api_token(username):
+        return cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+            "USERNAME": username, "PASSWORD": "TestPass1!"})["AuthenticationResult"]["AccessToken"]
+
+    disabled = api_token("bob")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="bob")
+    # A disabled user's token gets the generic answer before the scope is looked at.
+    for token, message in [
+        (sign_in("testuser", scope="email")["access_token"], "Access token does not contain the 'openid' scope"),
+        (api_token("testuser"), "Access token does not contain the 'openid' scope"),
+        (disabled, "Access token is expired or user has globally signed out, disabled, or been deleted"),
+    ]:
+        if auth_enabled:
+            assert _userinfo(token)[::2] == (401, {"error": "invalid_token", "error_description": message})
+        else:
+            assert _userinfo(token)[0] == 200
+    assert _userinfo(sign_in("testuser", scope="openid")["access_token"])[0] == 200
+
+
 def _userinfo_in_process(mod, token):
     """(status, WWW-Authenticate, body) of /oauth2/userInfo called in process."""
     status, headers, body = mod.handle_oauth2_userinfo(
@@ -5346,7 +5369,9 @@ def test_oauth2_userinfo_refuses_an_expired_token_under_auth(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(mod.time, "time", lambda: issued)
         expired = sign_in("carol")["AccessToken"]
-    assert _userinfo_in_process(mod, sign_in("carol")["AccessToken"])[0] == 200
+    # API tokens lack the openid scope; expiry is checked first.
+    assert _userinfo_in_process(mod, sign_in("carol")["AccessToken"])[2] == {
+        "error": "invalid_token", "error_description": "Access token does not contain the 'openid' scope"}
     assert _userinfo_in_process(mod, expired)[2] == {
         "error": "invalid_token",
         "error_description": "Access token is expired or user has globally signed out, disabled, or been deleted",

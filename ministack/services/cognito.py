@@ -7306,7 +7306,11 @@ def _userinfo_token_error(token: str):
         return "Value of username in token claims must be a String"
     pool = _get_pool_unscoped(str(claims.get("iss", "")).rsplit("/", 1)[-1])
     user = _user_from_token(token, pool) if pool else None
-    return None if user and user.get("Enabled", True) else expired
+    if not user or not user.get("Enabled", True):
+        return expired
+    if "openid" not in str(claims.get("scope", "")).split():
+        return "Access token does not contain the 'openid' scope"
+    return None
 
 
 def handle_oauth2_userinfo(method, path, headers, body, query_params):
