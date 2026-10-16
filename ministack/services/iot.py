@@ -5787,12 +5787,8 @@ def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tu
 
 def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
     """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
-    if not _RULE_NAME_RE.match(name or ""):
-        return error_response_json(
-            "InvalidRequestException",
-            "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
-            400,
-        )
+    if not _RULE_NAME_RE.fullmatch(name or ""):
+        return _error_rule_name(name or "")
     if name in _topic_rules:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Rule {name!r} already exists", 409
@@ -5827,16 +5823,21 @@ def _error_rule_denied(name: str) -> tuple:
 
 
 def _error_rule_name(name: str) -> tuple:
-    return error_response_json(
-        "InvalidRequestException",
-        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-        400,
+    """The 400 for a rule name outside the pattern, longer than 128, or both."""
+    failed = []
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+        failed.append("satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
+    if len(name) > 128:
+        failed.append("have length less than or equal to 128")
+    detail = "; ".join(
+        f"Value '{name}' at 'ruleName' failed to satisfy constraint: Member must {c}" for c in failed
     )
+    count = "1 validation error" if len(failed) == 1 else f"{len(failed)} validation errors"
+    return error_response_json("InvalidRequestException", f"{count} detected: {detail}", 400)
 
 
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
@@ -5850,7 +5851,7 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5860,7 +5861,7 @@ def _get_topic_rule(name: str) -> tuple:
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5870,7 +5871,7 @@ def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
 
 
 def _delete_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
